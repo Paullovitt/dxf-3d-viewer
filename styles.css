@@ -31,6 +31,14 @@ input[type="number"]{
   border: 1px solid rgba(255,255,255,.14);
   background: rgba(0,0,0,.25); color:#e7eef7;
 }
+select{
+  min-width: 140px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.14);
+  background: rgba(0,0,0,.25);
+  color:#e7eef7;
+}
 
 #help{
   position:absolute; left: 12px; bottom: 10px;

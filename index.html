@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="pt-br">
 <head>
   <meta charset="utf-8" />
@@ -20,7 +20,7 @@
     <div class="left">
       <label class="btn">
         Importar DXF(s)
-        <input id="fileInput" type="file" accept=".dxf" multiple hidden />
+        <input id="fileInput" type="file" accept=".dxf,.DXF" multiple hidden />
       </label>
 
       <button id="fitBtn" class="btn secondary">Enquadrar (Fit)</button>
@@ -34,7 +34,7 @@
       </label>
 
       <label class="row">
-        Centro automático
+        Centro automatico
         <input id="autoCenter" type="checkbox" checked />
       </label>
     </div>
@@ -46,6 +46,6 @@
     Mouse: <b>Esq</b> orbitar | <b>Meio</b> zoom | <b>Dir</b> pan
   </div>
 
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=legacyfix3"></script>
 </body>
 </html>

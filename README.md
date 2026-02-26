@@ -1,21 +1,26 @@
-# DXF 3D Viewer (Three.js)
+﻿# DXF 3D Viewer (Three.js)
 
 ## Como rodar
-Opção 1 (recomendado): servidor local
+Opcao 1 (recomendado - igual CNC, com parser Python + fallback JS)
 
-### Python
-1. Abra o terminal na pasta do projeto
-2. Rode:
-   - `python -m http.server 5173`
-3. Abra no navegador:
-   - `http://localhost:5173`
+1. Abra o terminal na pasta do projeto.
+2. Instale dependencia (uma vez):
+   - `pip install ezdxf`
+3. Rode:
+   - `python server.py --host 127.0.0.1 --port 5173`
+4. Abra no navegador:
+   - `http://127.0.0.1:5173`
 
-Opção 2: Live Server (VS Code)
-- Clique com o botão direito no `index.html` -> "Open with Live Server"
+Opcao 2 (somente estatico, parser JS local)
+- `python -m http.server 5173`
 
-## Importação
-- Clique em "Importar DXF(s)" e selecione 1 ou mais arquivos `.dxf`.
+## Importacao DXF
+- Clique em `Importar DXF(s)` e selecione arquivos `.dxf`.
+- Fluxo atual:
+  1. tenta parser Python (`/api/parse-dxf`)
+  2. se falhar, usa parser JS local
+  3. se ainda falhar, usa fallback via `dxf-parser`
 
-## Observações
-- Este demo extruda apenas **LWPOLYLINE/POLYLINE fechada**.
-- Se seu DXF tiver ARCs/SPLINE/CIRCLE, precisa converter/flatten ou implementar suporte.
+## Notas
+- Selecao destaca a borda real da geometria.
+- Layout/grade e controles foram mantidos.
