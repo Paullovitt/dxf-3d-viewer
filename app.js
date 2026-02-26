@@ -186,6 +186,7 @@ function clearSelection() {
   }
 
   selectedPart = null;
+  updateSelectedPieceBadge(null);
 }
 
 function buildSelectionOutline(part) {
@@ -200,6 +201,22 @@ function buildSelectionOutline(part) {
     depthTest: false,
     toneMapped: false
   });
+
+  const primaryLoop = part?.userData?.selectionPrimaryLoop;
+  if (Array.isArray(primaryLoop) && primaryLoop.length >= 3) {
+    const contour = primaryLoop
+      .map((p) => new THREE.Vector3(Number(p?.x), Number(p?.y), 0))
+      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+    if (contour.length >= 3) {
+      contour.push(contour[0].clone());
+      const loopGeo = new THREE.BufferGeometry().setFromPoints(contour);
+      const loopLine = new THREE.Line(loopGeo, lineMaterial);
+      loopLine.raycast = () => {};
+      outline.add(loopLine);
+    }
+  }
+
+  if (outline.children.length > 0) return outline;
 
   part.traverse((node) => {
     if (!(node && node.isMesh && node.geometry)) return;
@@ -231,6 +248,7 @@ function setSelectedPart(part) {
 
   selectedPart = part;
   transformControls.attach(selectedPart);
+  updateSelectedPieceBadge(selectedPart.name || "");
 
   selectionOutline = buildSelectionOutline(selectedPart);
   if (selectionOutline) selectedPart.add(selectionOutline);
@@ -299,6 +317,7 @@ window.addEventListener("keydown", (event) => {
   partsGroup.remove(part);
   disposeObject3D(part);
   updateGlobalBounds();
+  updatePieceCountBadge();
 });
 
 // ---------------------------
@@ -441,6 +460,32 @@ function arcToPolylinePoints(entity, maxSagitta = 0.35) {
   }
 
   return pts;
+}
+
+function splineToPolylinePoints(entity) {
+  if (entity?.type !== "SPLINE") return null;
+
+  const controlPoints = Array.isArray(entity.controlPoints) ? entity.controlPoints : [];
+  const fitPoints = Array.isArray(entity.fitPoints) ? entity.fitPoints : [];
+  const source = controlPoints.length >= 2 ? controlPoints : fitPoints;
+  if (source.length < 2) return null;
+
+  const pts = [];
+  for (const raw of source) {
+    const x = Number(raw?.x ?? raw?.[0]);
+    const y = Number(raw?.y ?? raw?.[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const next = new THREE.Vector2(x, y);
+    if (!pts.length || pts[pts.length - 1].distanceTo(next) > 1e-7) pts.push(next);
+  }
+  if (pts.length < 2) return null;
+
+  const flags = Number(entity?.flags || 0);
+  const closedByFlag = ((flags & 1) === 1);
+  const closed = !!entity?.closed || !!entity?.isClosed || closedByFlag || isClosedByGeometry(pts);
+  if (closed && pts.length > 1 && pts[0].distanceTo(pts[pts.length - 1]) <= 1e-6) pts.pop();
+
+  return { pts, closed };
 }
 
 function circleToShapeInfo(entity) {
@@ -985,6 +1030,45 @@ function parseDxfAsciiCnc(text) {
         if (closed && pts.length > 1 && distArray(pts[0], pts[pts.length - 1]) < 1e-6) pts.pop();
         contours.push({ points: pts, closed });
       }
+    } else if (value === "SPLINE") {
+      const closed = (parseInt(entityField(rec.fields, "70", "0"), 10) & 1) === 1;
+      const controlPoints = [];
+      const fitPoints = [];
+      let currentControl = null;
+      let currentFit = null;
+
+      for (const f of rec.fields) {
+        if (f[0] === "10") {
+          if (currentControl) controlPoints.push(currentControl);
+          currentControl = [parseNum(f[1]), 0.0];
+        } else if (f[0] === "20" && currentControl) {
+          currentControl[1] = parseNum(f[1]);
+        } else if (f[0] === "11") {
+          if (currentFit) fitPoints.push(currentFit);
+          currentFit = [parseNum(f[1]), 0.0];
+        } else if (f[0] === "21" && currentFit) {
+          currentFit[1] = parseNum(f[1]);
+        }
+      }
+      if (currentControl) controlPoints.push(currentControl);
+      if (currentFit) fitPoints.push(currentFit);
+
+      const source = controlPoints.length >= 2 ? controlPoints : fitPoints;
+      if (source.length >= 2) {
+        const pts = [];
+        for (const p of source) {
+          const x = parseNum(p[0]);
+          const y = parseNum(p[1]);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+          if (!pts.length || distArray(pts[pts.length - 1], [x, y]) > 1e-7) {
+            pts.push([x, y]);
+          }
+        }
+        if (pts.length >= 2) {
+          if (closed && pts.length > 1 && distArray(pts[0], pts[pts.length - 1]) < 1e-6) pts.pop();
+          contours.push({ points: pts, closed });
+        }
+      }
     }
     i = rec.next;
   }
@@ -1289,6 +1373,38 @@ function circleToLoopPoints(center, radius, segments = 72) {
   return pts;
 }
 
+function choosePrimarySelectionLoop(closedLoops, allPoints) {
+  let bestLoop = null;
+  let bestArea = 0;
+
+  for (const loop of (closedLoops || [])) {
+    if (!Array.isArray(loop) || loop.length < 3) continue;
+    const area = Math.abs(polygonAreaSigned(loop));
+    if (!(area > bestArea + 1e-8)) continue;
+    bestArea = area;
+    bestLoop = loop;
+  }
+
+  if (bestLoop && bestLoop.length >= 3) {
+    return bestLoop.map((p) => new THREE.Vector2(Number(p?.x), Number(p?.y)))
+      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+  }
+
+  const hull = convexHullFromPoints(allPoints || []);
+  if (Array.isArray(hull) && hull.length >= 3) return hull;
+  return null;
+}
+
+function assignSelectionOutlineData(localGroup, closedLoops, allPoints) {
+  if (!localGroup) return;
+  const loop = choosePrimarySelectionLoop(closedLoops, allPoints);
+  if (!loop || loop.length < 3) {
+    delete localGroup.userData.selectionPrimaryLoop;
+    return;
+  }
+  localGroup.userData.selectionPrimaryLoop = loop.map((p) => new THREE.Vector2(p.x, p.y));
+}
+
 function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
   const allowHullFallback = options.allowHullFallback !== false;
   const loops = [];
@@ -1388,6 +1504,39 @@ function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
     childrenByParent.set(parent, list);
   }
 
+  const descendantCountCache = new Map();
+  function countDescendants(idx) {
+    if (descendantCountCache.has(idx)) return descendantCountCache.get(idx);
+    const children = childrenByParent.get(idx) || [];
+    let total = children.length;
+    for (const childIdx of children) total += countDescendants(childIdx);
+    descendantCountCache.set(idx, total);
+    return total;
+  }
+
+  function shouldSkipAsPseudoHole(parentLoop, childLoop, childIdx) {
+    const parentArea = Math.max(EPS, Number(parentLoop?.areaAbs || 0));
+    const childArea = Math.max(0, Number(childLoop?.areaAbs || 0));
+    const areaRatio = childArea / parentArea;
+    if (!(areaRatio > 0.70)) return false;
+
+    const parentW = Math.max(EPS, Number(parentLoop?.bbox?.maxX) - Number(parentLoop?.bbox?.minX));
+    const parentH = Math.max(EPS, Number(parentLoop?.bbox?.maxY) - Number(parentLoop?.bbox?.minY));
+    const insetLeft = Number(childLoop?.bbox?.minX) - Number(parentLoop?.bbox?.minX);
+    const insetRight = Number(parentLoop?.bbox?.maxX) - Number(childLoop?.bbox?.maxX);
+    const insetBottom = Number(childLoop?.bbox?.minY) - Number(parentLoop?.bbox?.minY);
+    const insetTop = Number(parentLoop?.bbox?.maxY) - Number(childLoop?.bbox?.maxY);
+    const minInset = Math.min(insetLeft, insetRight, insetBottom, insetTop);
+    if (!(minInset >= -1e-4)) return false;
+
+    const nearBorderTol = Math.max(4.0, Math.min(parentW, parentH) * 0.06);
+    if (!(minInset <= nearBorderTol)) return false;
+
+    // Large inset loops with many descendants are usually duplicated borders,
+    // not real cutouts (common in some BricsCAD exports).
+    return countDescendants(childIdx) >= 6;
+  }
+
   const shapes = [];
   for (let i = 0; i < loops.length; i += 1) {
     const loop = loops[i];
@@ -1400,6 +1549,7 @@ function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
     for (const childIdx of children) {
       const child = loops[childIdx];
       if (child.depth % 2 !== 1) continue;
+      if (shouldSkipAsPseudoHole(loop, child, childIdx)) continue;
       const holePts = orientLoop(child.openPts, true);
       if (holePts.length < 3) continue;
       shape.holes.push(new THREE.Path(holePts));
@@ -1468,6 +1618,7 @@ function importWithCncContours(dxfText, filename, thickness, material, localGrou
     allPoints,
     { allowHullFallback: true }
   );
+  assignSelectionOutlineData(localGroup, closedLoops, allPoints);
   for (const shape of closedShapes) {
     const mesh = makeExtrudedMeshFromShape(shape, thickness, material);
     localGroup.add(mesh);
@@ -1518,6 +1669,7 @@ function finalizeImportedGroup(localGroup, autoCenter) {
   placeGroupInLayout(localGroup, partsGroup.children.length);
   partsGroup.add(localGroup);
   updateGlobalBounds();
+  updatePieceCountBadge();
   return true;
 }
 
@@ -1564,6 +1716,7 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
   const fallbackOpenShapes = [];
   const lineEntities = [];
   const arcEntities = [];
+  const splineEntities = [];
   const entityTypeCount = new Map();
 
   for (const ent of (dxf.entities || [])) {
@@ -1587,6 +1740,11 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
 
     if (ent?.type === "ARC") {
       arcEntities.push(ent);
+      continue;
+    }
+
+    if (ent?.type === "SPLINE") {
+      splineEntities.push(ent);
       continue;
     }
 
@@ -1624,6 +1782,21 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
     }
   }
 
+  for (const ent of splineEntities) {
+    const splineInfo = splineToPolylinePoints(ent);
+    if (!splineInfo || splineInfo.pts.length < 2) continue;
+    allPoints.push(...splineInfo.pts);
+
+    if (splineInfo.closed) {
+      const shapeInfo = buildShapeInfoFromPoints(splineInfo.pts);
+      if (shapeInfo) closedLoops.push(shapeInfo.outline.slice(0, -1));
+      continue;
+    }
+
+    openContoursForStitch.push(splineInfo.pts);
+    appendSegmentsFromPointList(splineInfo.pts, segments);
+  }
+
   let segmentLoops = extractClosedLoopsFromSegments(segments, 1e-4);
   if (segmentLoops.length === 0 && segments.length > 0) {
     // Some DXFs have tiny endpoint gaps; retry with relaxed snapping.
@@ -1647,6 +1820,7 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
     allPoints,
     { allowHullFallback: true }
   );
+  assignSelectionOutlineData(localGroup, closedLoops, allPoints);
 
   for (const shape of closedShapes) {
     const mesh = makeExtrudedMeshFromShape(shape, thickness, material);
@@ -1681,7 +1855,7 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
       onIssue,
       `Nenhuma entidade fechada encontrada em ${filename}. ` +
       `Tipos no arquivo: ${typesSummary || "n/a"}. ` +
-      "(Suporta LWPOLYLINE/POLYLINE, CIRCLE e loops de LINE/ARC)"
+      "(Suporta LWPOLYLINE/POLYLINE, CIRCLE, SPLINE e loops de LINE/ARC)"
     );
     return false;
   }
@@ -1723,11 +1897,43 @@ const thicknessEl = document.getElementById("thickness");
 const autoCenterEl = document.getElementById("autoCenter");
 const fitBtn = document.getElementById("fitBtn");
 const clearBtn = document.getElementById("clearBtn");
+const pieceCountEl = document.getElementById("pieceCount");
+const batchTimeEl = document.getElementById("batchTime");
+const selectedPieceEl = document.getElementById("selectedPiece");
+
+function updatePieceCountBadge() {
+  if (!pieceCountEl) return;
+  pieceCountEl.textContent = `Pecas: ${partsGroup.children.length}`;
+}
+
+function updateBatchTimeBadge(ms) {
+  if (!batchTimeEl) return;
+  const value = Number.isFinite(ms) ? Math.max(0, Math.round(ms)) : 0;
+  batchTimeEl.textContent = `Tempo: ${value} ms`;
+}
+
+function formatPieceLabel(name) {
+  const raw = String(name || "").trim();
+  if (!raw) return "-";
+  const base = raw.replace(/\.dxf$/i, "");
+  const match = base.match(/\d+/);
+  return match ? match[0] : base;
+}
+
+function updateSelectedPieceBadge(name) {
+  if (!selectedPieceEl) return;
+  selectedPieceEl.textContent = `Peca sel.: ${formatPieceLabel(name)}`;
+}
+
+updatePieceCountBadge();
+updateBatchTimeBadge(0);
+updateSelectedPieceBadge(null);
 
 fileInput.addEventListener("change", async (ev) => {
   const files = [...(ev.target.files || [])];
   if (files.length === 0) return;
 
+  const importStart = performance.now();
   const thickness = Number(thicknessEl.value || 5);
   const autoCenter = !!autoCenterEl.checked;
   const importIssues = [];
@@ -1767,6 +1973,8 @@ fileInput.addEventListener("change", async (ev) => {
       importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
     }
   }
+  const importDurationMs = performance.now() - importStart;
+  updateBatchTimeBadge(importDurationMs);
 
   if (importIssues.length > 0) {
     const uniqueIssues = [...new Set(importIssues)];
@@ -1802,6 +2010,7 @@ clearBtn.addEventListener("click", () => {
     disposeObject3D(child);
   }
   updateGlobalBounds();
+  updatePieceCountBadge();
 });
 
 // ---------------------------

@@ -24,6 +24,15 @@ html, body { height: 100%; margin: 0; background: #0b0f14; color: #e7eef7; font-
 .btn.secondary{ opacity: .9; }
 .btn.danger{ border-color: rgba(255,90,90,.35); }
 .btn.danger:hover{ background: rgba(255,90,90,.12); }
+.counter{
+  border: 1px solid rgba(255,255,255,.15);
+  background: rgba(255,255,255,.04);
+  color:#cfe0f3;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 13px;
+  white-space: nowrap;
+}
 
 .row{ display:flex; align-items:center; gap: 8px; font-size: 14px; opacity:.95; }
 input[type="number"]{
