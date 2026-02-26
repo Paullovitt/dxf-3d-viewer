@@ -74,6 +74,156 @@ const LAYOUT_LAYER_SIZE = LAYOUT_COLUMNS * LAYOUT_ROWS_PER_LAYER;
 const LAYOUT_COLLISION_MARGIN = 1;
 const LAYOUT_PUSH_STEP = 18;
 const EPS = 1e-6;
+const CPU_CORES = Math.max(1, Number(navigator.hardwareConcurrency || 1));
+const DXF_PARSE_WORKERS = Math.max(1, CPU_CORES);
+let dxfWorkerPool = null;
+
+function createDxfWorkerPool(workerCount) {
+  if (typeof Worker === "undefined") return null;
+  const count = Math.max(1, Number(workerCount || 1));
+  const workerUrl = `./dxf-worker.js?v=2`;
+  const slots = [];
+  const queue = [];
+  const pending = new Map();
+  let nextId = 1;
+
+  function dispatch() {
+    for (const slot of slots) {
+      if (slot.busy) continue;
+      const job = queue.shift();
+      if (!job) break;
+      slot.busy = true;
+      slot.jobId = job.id;
+      pending.set(job.id, job);
+      slot.worker.postMessage({
+        type: "parse",
+        id: job.id,
+        text: job.text
+      });
+    }
+  }
+
+  function handleSettled(slot, id, ok, payload) {
+    const job = pending.get(id);
+    pending.delete(id);
+    slot.busy = false;
+    slot.jobId = null;
+    if (!job) {
+      dispatch();
+      return;
+    }
+
+    if (ok) job.resolve(payload);
+    else job.reject(payload instanceof Error ? payload : new Error(String(payload || "Worker error")));
+    dispatch();
+  }
+
+  for (let i = 0; i < count; i += 1) {
+    const worker = new Worker(workerUrl);
+    const slot = { worker, busy: false, jobId: null };
+
+    worker.onmessage = (event) => {
+      const data = event?.data || {};
+      const id = Number(data.id);
+      if (!Number.isFinite(id)) return;
+      if (data.ok) {
+        handleSettled(slot, id, true, data.parsed || null);
+      } else {
+        handleSettled(slot, id, false, new Error(String(data.error || "Worker parse failed")));
+      }
+    };
+
+    worker.onerror = (event) => {
+      if (slot.jobId != null) {
+        handleSettled(slot, slot.jobId, false, new Error(event?.message || "Worker execution error"));
+      } else {
+        slot.busy = false;
+        slot.jobId = null;
+      }
+    };
+
+    slots.push(slot);
+  }
+
+  function runParse(text) {
+    return new Promise((resolve, reject) => {
+      const id = nextId++;
+      queue.push({
+        id,
+        text: String(text || ""),
+        resolve,
+        reject
+      });
+      dispatch();
+    });
+  }
+
+  function terminate() {
+    for (const slot of slots) {
+      slot.worker.terminate();
+      slot.busy = false;
+      slot.jobId = null;
+    }
+
+    for (const [, job] of pending) {
+      job.reject(new Error("Worker pool terminated"));
+    }
+    pending.clear();
+
+    while (queue.length > 0) {
+      const job = queue.shift();
+      if (job?.reject) job.reject(new Error("Worker pool terminated"));
+    }
+  }
+
+  return {
+    size: count,
+    runParse,
+    terminate
+  };
+}
+
+function getDxfWorkerPool() {
+  if (dxfWorkerPool !== null) return dxfWorkerPool;
+  try {
+    dxfWorkerPool = createDxfWorkerPool(DXF_PARSE_WORKERS);
+    return dxfWorkerPool;
+  } catch (error) {
+    console.warn("DXF worker pool indisponivel; fallback para parse local.", error);
+    dxfWorkerPool = undefined;
+    return dxfWorkerPool;
+  }
+}
+
+async function parseDxfWithWorkers(dxfText, filename = "") {
+  const pool = getDxfWorkerPool();
+  if (!pool || typeof pool.runParse !== "function") return null;
+
+  try {
+    return await pool.runParse(dxfText);
+  } catch (error) {
+    console.warn("Falha no parse em worker para:", filename, error);
+    return null;
+  }
+}
+
+function cachePartBounds(part) {
+  if (!part) return null;
+  part.updateMatrixWorld(true);
+  const cached = (part.userData?.layoutBounds instanceof THREE.Box3)
+    ? part.userData.layoutBounds
+    : new THREE.Box3();
+  cached.setFromObject(part);
+  part.userData.layoutBounds = cached;
+  return cached;
+}
+
+function getCachedPartBounds(part) {
+  if (!part) return null;
+  const cached = part.userData?.layoutBounds;
+  if (cached instanceof THREE.Box3) return cached;
+  return cachePartBounds(part);
+}
 
 function alternatingOffset(index) {
   if (index === 0) return 0;
@@ -115,7 +265,9 @@ function placeGroupInLayout(localGroup, index) {
 
     let collided = false;
     for (const child of partsGroup.children) {
-      layoutChildBox.setFromObject(child);
+      const childBounds = getCachedPartBounds(child);
+      if (!childBounds) continue;
+      layoutChildBox.copy(childBounds);
       layoutChildBox.expandByScalar(LAYOUT_COLLISION_MARGIN);
       if (layoutProbeBox.intersectsBox(layoutChildBox)) {
         collided = true;
@@ -145,6 +297,7 @@ transformControls.addEventListener("dragging-changed", (event) => {
 });
 
 transformControls.addEventListener("objectChange", () => {
+  if (selectedPart) cachePartBounds(selectedPart);
   updateGlobalBounds();
 });
 
@@ -1362,6 +1515,12 @@ function convexHullFromPoints(points) {
 }
 
 function circleToLoopPoints(center, radius, segments = 72) {
+  if (!(Number.isFinite(segments) && segments >= 6)) {
+    const sagitta = Math.min(Math.max(0.35, 0.05), Math.max(radius, 0.1) * 0.5);
+    const acosArg = THREE.MathUtils.clamp(1 - (sagitta / Math.max(radius, 1e-6)), -1, 1);
+    const stepAngle = Math.max(THREE.MathUtils.degToRad(5), 2 * Math.acos(acosArg));
+    segments = THREE.MathUtils.clamp(Math.ceil((Math.PI * 2) / stepAngle), 12, 96);
+  }
   const pts = [];
   for (let i = 0; i < segments; i += 1) {
     const a = (i / segments) * Math.PI * 2;
@@ -1668,12 +1827,19 @@ function finalizeImportedGroup(localGroup, autoCenter) {
   }
   placeGroupInLayout(localGroup, partsGroup.children.length);
   partsGroup.add(localGroup);
-  updateGlobalBounds();
+
+  const localBounds = cachePartBounds(localGroup);
+  if (localBounds) {
+    if (bboxAll.isEmpty()) bboxAll.copy(localBounds);
+    else bboxAll.union(localBounds);
+  } else {
+    updateGlobalBounds();
+  }
   updatePieceCountBadge();
   return true;
 }
 
-function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue = null) {
+function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue = null, preParsed = null) {
   const material = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setHSL(Math.random(), 0.6, 0.55),
     metalness: 0.05,
@@ -1692,7 +1858,8 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
       thickness,
       material,
       localGroup,
-      onIssue
+      onIssue,
+      preParsed
     );
     if (okCnc) return finalizeImportedGroup(localGroup, autoCenter);
   } catch (error) {
@@ -1725,7 +1892,7 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
 
     const circleInfo = circleToShapeInfo(ent);
     if (circleInfo) {
-      const loopPts = circleToLoopPoints(circleInfo.center, circleInfo.radius, 72);
+      const loopPts = circleToLoopPoints(circleInfo.center, circleInfo.radius);
       if (loopPts.length >= 3) {
         closedLoops.push(loopPts);
         allPoints.push(...loopPts);
@@ -1865,8 +2032,9 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
 function updateGlobalBounds() {
   bboxAll.makeEmpty();
   for (const child of partsGroup.children) {
-    tempBox.setFromObject(child);
-    bboxAll.union(tempBox);
+    const childBounds = getCachedPartBounds(child);
+    if (!childBounds) continue;
+    bboxAll.union(childBounds);
   }
 }
 
@@ -1929,6 +2097,29 @@ updatePieceCountBadge();
 updateBatchTimeBadge(0);
 updateSelectedPieceBadge(null);
 
+async function decodeDxfFile(file) {
+  let text = await file.text();
+  if (text.includes("\u0000")) {
+    try {
+      const buf = await file.arrayBuffer();
+      text = new TextDecoder("utf-16le").decode(buf);
+    } catch (decodeUtf16Error) {
+      console.warn("Falha no decode utf-16le para:", file?.name, decodeUtf16Error);
+    }
+  }
+
+  if (!/SECTION/i.test(String(text).slice(0, 1200))) {
+    try {
+      const buf = await file.arrayBuffer();
+      text = new TextDecoder("latin1").decode(buf);
+    } catch (decodeError) {
+      console.warn("Falha no decode latin1 para:", file?.name, decodeError);
+    }
+  }
+
+  return String(text || "").replace(/\u0000/g, "");
+}
+
 fileInput.addEventListener("change", async (ev) => {
   const files = [...(ev.target.files || [])];
   if (files.length === 0) return;
@@ -1939,40 +2130,41 @@ fileInput.addEventListener("change", async (ev) => {
   const importIssues = [];
   let importedCount = 0;
 
-  for (const f of files) {
-    let text = await f.text();
-    if (text.includes("\u0000")) {
-      try {
-        const buf = await f.arrayBuffer();
-        text = new TextDecoder("utf-16le").decode(buf);
-      } catch (decodeUtf16Error) {
-        console.warn("Falha no decode utf-16le para:", f?.name, decodeUtf16Error);
-      }
+  const workerPool = getDxfWorkerPool();
+
+  await Promise.all(files.map(async (f) => {
+    let text = "";
+    try {
+      text = await decodeDxfFile(f);
+    } catch (decodeError) {
+      console.error("Falha inesperada no decode:", f?.name, decodeError);
+      importIssues.push(`Falha inesperada ao ler ${f?.name || "arquivo"}. Veja o console (F12).`);
+      return;
     }
 
-    if (!/SECTION/i.test(String(text).slice(0, 1200))) {
-      try {
-        const buf = await f.arrayBuffer();
-        text = new TextDecoder("latin1").decode(buf);
-      } catch (decodeError) {
-        console.warn("Falha no decode latin1 para:", f?.name, decodeError);
-      }
-    }
-    text = String(text || "").replace(/\u0000/g, "");
+    const preParsed = workerPool
+      ? await parseDxfWithWorkers(text, f?.name || "")
+      : null;
+
     try {
       const ok = addDxfToScene(
         text,
         f.name,
         thickness,
         autoCenter,
-        (msg) => importIssues.push(msg)
+        (msg) => importIssues.push(msg),
+        preParsed
       );
       if (ok) importedCount += 1;
     } catch (error) {
       console.error("Falha inesperada ao importar:", f?.name, error);
       importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
+    } finally {
+      // Atualiza o tempo enquanto o lote ainda esta processando.
+      updateBatchTimeBadge(performance.now() - importStart);
     }
-  }
+  }));
+
   const importDurationMs = performance.now() - importStart;
   updateBatchTimeBadge(importDurationMs);
 
@@ -2011,6 +2203,12 @@ clearBtn.addEventListener("click", () => {
   }
   updateGlobalBounds();
   updatePieceCountBadge();
+});
+
+window.addEventListener("beforeunload", () => {
+  if (dxfWorkerPool && typeof dxfWorkerPool.terminate === "function") {
+    dxfWorkerPool.terminate();
+  }
 });
 
 // ---------------------------
