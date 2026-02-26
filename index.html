@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DXF 3D Viewer</title>
+  <link rel="stylesheet" href="./styles.css" />
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="topbar">
+    <div class="left">
+      <label class="btn">
+        Importar DXF(s)
+        <input id="fileInput" type="file" accept=".dxf" multiple hidden />
+      </label>
+
+      <button id="fitBtn" class="btn secondary">Enquadrar (Fit)</button>
+      <button id="clearBtn" class="btn danger">Limpar</button>
+    </div>
+
+    <div class="right">
+      <label class="row">
+        Espessura (Z)
+        <input id="thickness" type="number" value="5" min="0.1" step="0.1" />
+      </label>
+
+      <label class="row">
+        Centro automático
+        <input id="autoCenter" type="checkbox" checked />
+      </label>
+    </div>
+  </div>
+
+  <div id="viewport"></div>
+
+  <div id="help">
+    Mouse: <b>Esq</b> orbitar | <b>Meio</b> zoom | <b>Dir</b> pan
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
