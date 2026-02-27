@@ -30,6 +30,8 @@ APIs nativas do browser:
 
 ## 4. Como executar
 
+### 4.1 Modo atual (somente frontend / estatico)
+
 Na pasta do projeto:
 
 ```bash
@@ -180,10 +182,14 @@ Melhorias implementadas:
 - parse em worker pool (`navigator.hardwareConcurrency`)
 - reducao adaptativa de `curveSegments` conforme quantidade de furos
 - filtros para remover loops/overlays espurios antes da extrusao
+- cache persistente de parse DXF em `IndexedDB` (reaproveita contornos entre aberturas)
+- cache persistente da malha extrudada (`BufferGeometry`) por `arquivo + espessura`
 
 Efeito esperado:
 - menos travamento em chapas com centenas/milhares de furos
 - menor custo de triangulacao desnecessaria
+- reabertura mais rapida da mesma peca (mesmo apos `F5` e botao `Limpar`)
+- o topo mostra `Cache M:H/M/S P:H/M/S` para confirmar uso de cache de malha (M) e parse (P)
 
 ## 11. Avisos e mensagens de importacao
 
@@ -242,16 +248,14 @@ Se houver erro de autenticacao no push, configurar credencial/token do GitHub no
 
 - Geometria antiga no navegador:
   - `Ctrl + F5`
+- Limpar cache persistente (parse + malha):
+  - DevTools -> Application -> Storage (ou IndexedDB) -> limpar dados do site
 - Import falhando:
   - abrir `F12` e conferir tipos de entidade detectados
 - Pecas sobrepostas:
   - usar `Enquadrar (Fit)` e verificar `Centro automatico`
 - DXF com canto/furo estranho:
   - validar se veio em `LINE/ARC` aberto e revisar logs de stitch/hierarquia
-- Erro `Falha ao converter ... no servidor (501)`:
-  - isso ocorre quando esta rodando apenas servidor estatico sem API
-  - o app faz fallback silencioso para o pipeline browser no arquivo atual, sem trocar o modo selecionado no topo
-
 ## 16. Casos resolvidos
 
 ### Caso A - Painel perfurado preenchendo lado interno (ex.: `210921`)
@@ -295,51 +299,9 @@ Se houver erro de autenticacao no push, configurar credencial/token do GitHub no
 - Commit:
   - `d7ceece`
 
-## 17. Modo A/B no frontend (Atual x Nova arquitetura)
+## 17. Modo importacao
 
-No topo da tela existe `Modo importacao` com duas opcoes:
+No topo da tela existe `Modo importacao` com uma opcao:
 
-- `Atual (DXF no navegador)`:
+- `Atual (Browser DXF)`:
   - usa o pipeline JS atual (`dxf-worker.js` + fallback `dxf-parser`)
-- `Nova (EZDXF + GLB servidor)`:
-  - envia o arquivo DXF para o backend
-  - backend retorna GLB pronto
-  - frontend apenas carrega o GLB no viewer atual
-
-Objetivo:
-- comparar qualidade/geometria e desempenho entre os dois fluxos no mesmo viewer.
-
-Comportamento de seguranca:
-- se o endpoint de servidor nao existir (ex.: servidor estatico `python -m http.server`),
-  o frontend detecta status como `404/405/501` ou resposta HTML e faz fallback
-  silencioso para o pipeline browser no arquivo atual, mantendo o modo selecionado
-  no topo para voce alterar manualmente quando quiser.
-
-## 18. Backend recomendado (EZDXF + cache GLB)
-
-Arquitetura recomendada:
-1. usar `ezdxf` para parse + healing do DXF
-2. gerar malha 3D e exportar `GLB` no servidor
-3. cachear por hash de entrada (`dxf + espessura + versao do pipeline`)
-4. opcional: gerar JSON com metadados 2D (contornos/furos) para selecao avancada
-
-### 18.1 Endpoint esperado pelo frontend
-
-`POST /api/convert-dxf-glb` (multipart/form-data):
-- `file`: arquivo `.dxf`
-- `thickness`: espessura em Z
-
-Respostas aceitas pelo frontend:
-
-1. Binario GLB direto:
-- `Content-Type: model/gltf-binary`
-- corpo = bytes do `.glb`
-
-2. JSON:
-- `glbBase64`: GLB em base64
-ou
-- `glbUrl`: URL para download do GLB
-
-Campos opcionais:
-- `warnings`: lista de avisos
-- `meta2d`: metadados 2D (contorno/furos), quando quiser suportar selecao avancada por dados CAD

@@ -1,7 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // DXF parser (CDN)
 import DxfParser from "https://esm.sh/dxf-parser@1.1.2";
@@ -20,7 +19,6 @@ camera.position.set(180, 160, 180);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 container.appendChild(renderer.domElement);
-const gltfLoader = new GLTFLoader();
 
 // Lights
 scene.add(new THREE.AmbientLight(0xffffff, 0.65));
@@ -78,7 +76,23 @@ const LAYOUT_PUSH_STEP = 18;
 const EPS = 1e-6;
 const CPU_CORES = Math.max(1, Number(navigator.hardwareConcurrency || 1));
 const DXF_PARSE_WORKERS = Math.max(1, CPU_CORES);
+const DXF_CACHE_DB_NAME = "dxf-3d-viewer-cache";
+const DXF_PARSE_CACHE_STORE_NAME = "parsed-contours";
+const DXF_MESH_CACHE_STORE_NAME = "mesh-groups";
+const DXF_CACHE_SCHEMA_VERSION = 2;
+const DXF_PARSE_CACHE_PIPELINE_VERSION = "browser-parse-v1";
+const DXF_MESH_CACHE_PIPELINE_VERSION = "browser-mesh-v1";
+const DXF_PARSE_CACHE_MAX_ENTRIES = 120;
+const DXF_PARSE_CACHE_MAX_BYTES = 80 * 1024 * 1024;
+const DXF_MESH_CACHE_MAX_ENTRIES = 32;
+const DXF_MESH_CACHE_MAX_BYTES = 280 * 1024 * 1024;
+const DXF_CACHE_STORE_NAME = DXF_PARSE_CACHE_STORE_NAME;
+const DXF_CACHE_PIPELINE_VERSION = DXF_PARSE_CACHE_PIPELINE_VERSION;
+const DXF_CACHE_MAX_ENTRIES = DXF_PARSE_CACHE_MAX_ENTRIES;
+const DXF_CACHE_MAX_BYTES = DXF_PARSE_CACHE_MAX_BYTES;
 let dxfWorkerPool = null;
+let dxfCacheDbPromise = null;
+let dxfCacheInitLogged = false;
 
 function createDxfWorkerPool(workerCount) {
   if (typeof Worker === "undefined") return null;
@@ -206,6 +220,540 @@ async function parseDxfWithWorkers(dxfText, filename = "") {
   } catch (error) {
     console.warn("Falha no parse em worker para:", filename, error);
     return null;
+  }
+}
+
+function idbRequestToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+  });
+}
+
+function waitForTransaction(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
+    tx.onerror = () => reject(tx.error || new Error("IndexedDB transaction failed"));
+  });
+}
+
+function supportsPersistentDxfCache() {
+  return typeof indexedDB !== "undefined";
+}
+
+function ensureObjectStore(db, name) {
+  if (db.objectStoreNames.contains(name)) return null;
+  const store = db.createObjectStore(name, { keyPath: "key" });
+  store.createIndex("updatedAt", "updatedAt", { unique: false });
+  return store;
+}
+
+async function openDxfCacheDb() {
+  if (!supportsPersistentDxfCache()) return null;
+  if (dxfCacheDbPromise) return dxfCacheDbPromise;
+
+  dxfCacheDbPromise = new Promise((resolve) => {
+    try {
+      const request = indexedDB.open(DXF_CACHE_DB_NAME, DXF_CACHE_SCHEMA_VERSION);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        ensureObjectStore(db, DXF_PARSE_CACHE_STORE_NAME);
+        ensureObjectStore(db, DXF_MESH_CACHE_STORE_NAME);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+      request.onblocked = () => resolve(null);
+    } catch (_error) {
+      resolve(null);
+    }
+  });
+
+  return dxfCacheDbPromise;
+}
+
+function estimateJsonSizeBytes(value) {
+  try {
+    return new Blob([JSON.stringify(value)]).size;
+  } catch (_error) {
+    return 0;
+  }
+}
+
+async function computeArrayBufferHashHex(arrayBuffer) {
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle && typeof subtle.digest === "function") {
+    const digest = await subtle.digest("SHA-256", arrayBuffer);
+    const bytes = new Uint8Array(digest);
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return hex;
+  }
+
+  // Fallback deterministic hash when SubtleCrypto is unavailable.
+  const bytes = new Uint8Array(arrayBuffer);
+  let hash = 2166136261;
+  for (let i = 0; i < bytes.length; i += 1) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a_${(hash >>> 0).toString(16)}_${bytes.length}`;
+}
+
+function buildParsedCacheKeyFromHash(hash) {
+  if (!hash) return "";
+  return `${DXF_CACHE_PIPELINE_VERSION}:${hash}`;
+}
+
+function buildMeshCacheKeyFromHash(hash, thickness) {
+  if (!hash) return "";
+  return `${DXF_MESH_CACHE_PIPELINE_VERSION}:${hash}:t=${Number(thickness)}`;
+}
+
+async function buildParsedCacheKey(arrayBuffer) {
+  const hash = await computeArrayBufferHashHex(arrayBuffer);
+  return buildParsedCacheKeyFromHash(hash);
+}
+
+function isValidParsedPayload(parsed) {
+  if (!parsed || typeof parsed !== "object") return false;
+  if (!Array.isArray(parsed.contours)) return false;
+  if (!Number.isFinite(Number(parsed.width))) return false;
+  if (!Number.isFinite(Number(parsed.height))) return false;
+  return true;
+}
+
+async function getParsedFromPersistentCache(cacheKey) {
+  if (!cacheKey) return null;
+  const db = await openDxfCacheDb();
+  if (!db) return null;
+
+  try {
+    const tx = db.transaction(DXF_CACHE_STORE_NAME, "readonly");
+    const store = tx.objectStore(DXF_CACHE_STORE_NAME);
+    const record = await idbRequestToPromise(store.get(cacheKey));
+    await waitForTransaction(tx);
+    if (!record || !isValidParsedPayload(record.parsed)) return null;
+
+    // Async touch to keep recent entries alive.
+    try {
+      const writeTx = db.transaction(DXF_CACHE_STORE_NAME, "readwrite");
+      const writeStore = writeTx.objectStore(DXF_CACHE_STORE_NAME);
+      writeStore.put({
+        ...record,
+        hits: Number(record.hits || 0) + 1,
+        updatedAt: Date.now()
+      });
+    } catch (_touchError) {
+      // no-op
+    }
+
+    return record.parsed;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function trimPersistentParsedCache(db) {
+  try {
+    const tx = db.transaction(DXF_CACHE_STORE_NAME, "readonly");
+    const store = tx.objectStore(DXF_CACHE_STORE_NAME);
+    const all = await idbRequestToPromise(store.getAll());
+    await waitForTransaction(tx);
+    if (!Array.isArray(all) || all.length === 0) return;
+
+    const sorted = all
+      .slice()
+      .sort((a, b) => Number(b?.updatedAt || 0) - Number(a?.updatedAt || 0));
+
+    const keysToDelete = new Set();
+    if (sorted.length > DXF_CACHE_MAX_ENTRIES) {
+      for (const rec of sorted.slice(DXF_CACHE_MAX_ENTRIES)) {
+        if (rec?.key) keysToDelete.add(rec.key);
+      }
+    }
+
+    let totalBytes = 0;
+    for (const rec of sorted) totalBytes += Number(rec?.approxBytes || 0);
+
+    if (totalBytes > DXF_CACHE_MAX_BYTES) {
+      for (let i = sorted.length - 1; i >= 0 && totalBytes > DXF_CACHE_MAX_BYTES; i -= 1) {
+        const rec = sorted[i];
+        if (!rec?.key || keysToDelete.has(rec.key)) continue;
+        keysToDelete.add(rec.key);
+        totalBytes -= Number(rec?.approxBytes || 0);
+      }
+    }
+
+    if (keysToDelete.size === 0) return;
+
+    const writeTx = db.transaction(DXF_CACHE_STORE_NAME, "readwrite");
+    const writeStore = writeTx.objectStore(DXF_CACHE_STORE_NAME);
+    for (const key of keysToDelete) writeStore.delete(key);
+    await waitForTransaction(writeTx);
+  } catch (_error) {
+    // no-op
+  }
+}
+
+async function putParsedInPersistentCache(cacheKey, parsed, file) {
+  if (!cacheKey || !isValidParsedPayload(parsed)) return false;
+  const db = await openDxfCacheDb();
+  if (!db) return false;
+
+  const now = Date.now();
+  const approxBytes = estimateJsonSizeBytes(parsed);
+  const record = {
+    key: cacheKey,
+    parsed,
+    approxBytes,
+    fileName: String(file?.name || ""),
+    fileSize: Number(file?.size || 0),
+    createdAt: now,
+    updatedAt: now,
+    hits: 0
+  };
+
+  try {
+    const tx = db.transaction(DXF_CACHE_STORE_NAME, "readwrite");
+    const store = tx.objectStore(DXF_CACHE_STORE_NAME);
+    store.put(record);
+    await waitForTransaction(tx);
+    await trimPersistentParsedCache(db);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function typedArrayFromCtorName(ctorName, sourceArray) {
+  switch (String(ctorName || "")) {
+    case "Float32Array": return new Float32Array(sourceArray);
+    case "Float64Array": return new Float64Array(sourceArray);
+    case "Int8Array": return new Int8Array(sourceArray);
+    case "Uint8Array": return new Uint8Array(sourceArray);
+    case "Uint8ClampedArray": return new Uint8ClampedArray(sourceArray);
+    case "Int16Array": return new Int16Array(sourceArray);
+    case "Uint16Array": return new Uint16Array(sourceArray);
+    case "Int32Array": return new Int32Array(sourceArray);
+    case "Uint32Array": return new Uint32Array(sourceArray);
+    default:
+      return null;
+  }
+}
+
+function cloneTypedArray(value) {
+  if (!value || typeof value.length !== "number") return null;
+  const ctorName = value.constructor?.name;
+  return typedArrayFromCtorName(ctorName, value);
+}
+
+function serializeBufferAttribute(attr) {
+  if (!attr || !attr.array) return null;
+  const arr = cloneTypedArray(attr.array);
+  if (!arr) return null;
+  return {
+    itemSize: Number(attr.itemSize || 0),
+    normalized: !!attr.normalized,
+    ctor: arr.constructor.name,
+    array: arr
+  };
+}
+
+function deserializeBufferAttribute(raw) {
+  if (!raw || !raw.array) return null;
+  const arr = typedArrayFromCtorName(raw.ctor, raw.array);
+  if (!arr || !Number.isFinite(Number(raw.itemSize)) || Number(raw.itemSize) < 1) return null;
+  return new THREE.BufferAttribute(arr, Number(raw.itemSize), !!raw.normalized);
+}
+
+function estimateTypedArrayBytes(value) {
+  if (!value || typeof value.byteLength !== "number") return 0;
+  return Number(value.byteLength || 0);
+}
+
+function serializeBufferGeometry(geometry) {
+  if (!geometry || !geometry.isBufferGeometry) return null;
+
+  const attributes = {};
+  for (const [name, attr] of Object.entries(geometry.attributes || {})) {
+    const serialized = serializeBufferAttribute(attr);
+    if (serialized) attributes[name] = serialized;
+  }
+
+  const index = geometry.index ? serializeBufferAttribute(geometry.index) : null;
+  const groups = Array.isArray(geometry.groups)
+    ? geometry.groups.map((g) => ({
+      start: Number(g.start || 0),
+      count: Number(g.count || 0),
+      materialIndex: Number(g.materialIndex || 0)
+    }))
+    : [];
+
+  return {
+    attributes,
+    index,
+    groups
+  };
+}
+
+function deserializeBufferGeometry(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const geometry = new THREE.BufferGeometry();
+
+  for (const [name, rawAttr] of Object.entries(snapshot.attributes || {})) {
+    const attr = deserializeBufferAttribute(rawAttr);
+    if (attr) geometry.setAttribute(name, attr);
+  }
+
+  if (snapshot.index) {
+    const indexAttr = deserializeBufferAttribute(snapshot.index);
+    if (indexAttr) geometry.setIndex(indexAttr);
+  }
+
+  if (Array.isArray(snapshot.groups) && snapshot.groups.length > 0) {
+    geometry.clearGroups();
+    for (const g of snapshot.groups) {
+      geometry.addGroup(
+        Number(g?.start || 0),
+        Number(g?.count || 0),
+        Number(g?.materialIndex || 0)
+      );
+    }
+  }
+
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+function serializeMeshMaterial(material) {
+  const mat = Array.isArray(material) ? material[0] : material;
+  if (!mat) return null;
+  const colorHex = mat.color ? mat.color.getHex() : 0x8b5cf6;
+  return {
+    color: Number(colorHex),
+    metalness: Number(mat.metalness ?? 0.05),
+    roughness: Number(mat.roughness ?? 0.85),
+    opacity: Number(mat.opacity ?? 1),
+    transparent: !!mat.transparent,
+    side: Number(mat.side ?? THREE.FrontSide)
+  };
+}
+
+function deserializeMeshMaterial(snapshot) {
+  const data = snapshot || {};
+  return new THREE.MeshStandardMaterial({
+    color: Number(data.color ?? 0x8b5cf6),
+    metalness: Number(data.metalness ?? 0.05),
+    roughness: Number(data.roughness ?? 0.85),
+    opacity: Number(data.opacity ?? 1),
+    transparent: !!data.transparent,
+    side: Number(data.side ?? THREE.FrontSide)
+  });
+}
+
+function serializeSelectionPrimaryLoop(loop) {
+  if (!Array.isArray(loop) || loop.length < 3) return null;
+  const out = [];
+  for (const p of loop) {
+    const x = Number(p?.x);
+    const y = Number(p?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push([x, y]);
+  }
+  return out.length >= 3 ? out : null;
+}
+
+function deserializeSelectionPrimaryLoop(rawLoop) {
+  if (!Array.isArray(rawLoop) || rawLoop.length < 3) return null;
+  const out = [];
+  for (const p of rawLoop) {
+    const x = Number(Array.isArray(p) ? p[0] : p?.x);
+    const y = Number(Array.isArray(p) ? p[1] : p?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push(new THREE.Vector2(x, y));
+  }
+  return out.length >= 3 ? out : null;
+}
+
+function serializeMeshGroupSnapshot(localGroup, thickness) {
+  if (!localGroup || !localGroup.isObject3D) return null;
+  localGroup.updateMatrixWorld(true);
+
+  const meshes = [];
+  localGroup.traverse((node) => {
+    if (!node?.isMesh || !node.geometry) return;
+    const geometry = serializeBufferGeometry(node.geometry);
+    if (!geometry) return;
+    const material = serializeMeshMaterial(node.material);
+
+    meshes.push({
+      name: String(node.name || ""),
+      geometry,
+      material,
+      position: [node.position.x, node.position.y, node.position.z],
+      quaternion: [node.quaternion.x, node.quaternion.y, node.quaternion.z, node.quaternion.w],
+      scale: [node.scale.x, node.scale.y, node.scale.z]
+    });
+  });
+
+  if (meshes.length === 0) return null;
+
+  return {
+    thickness: Number(thickness),
+    selectionPrimaryLoop: serializeSelectionPrimaryLoop(localGroup.userData?.selectionPrimaryLoop),
+    meshes
+  };
+}
+
+function estimateMeshSnapshotBytes(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.meshes)) return 0;
+  let total = 0;
+  for (const mesh of snapshot.meshes) {
+    const index = mesh?.geometry?.index;
+    if (index?.array) total += estimateTypedArrayBytes(index.array);
+    for (const attr of Object.values(mesh?.geometry?.attributes || {})) {
+      if (attr?.array) total += estimateTypedArrayBytes(attr.array);
+    }
+    total += 256;
+  }
+  return total;
+}
+
+function buildGroupFromMeshSnapshot(snapshot, fallbackName = "") {
+  if (!snapshot || !Array.isArray(snapshot.meshes) || snapshot.meshes.length === 0) return null;
+
+  const group = new THREE.Group();
+  group.name = String(fallbackName || "arquivo.dxf");
+
+  const selLoop = deserializeSelectionPrimaryLoop(snapshot.selectionPrimaryLoop);
+  if (selLoop) group.userData.selectionPrimaryLoop = selLoop;
+
+  for (const meshData of snapshot.meshes) {
+    const geometry = deserializeBufferGeometry(meshData.geometry);
+    if (!geometry) continue;
+    const material = deserializeMeshMaterial(meshData.material);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = String(meshData?.name || "");
+
+    const pos = Array.isArray(meshData?.position) ? meshData.position : [];
+    const quat = Array.isArray(meshData?.quaternion) ? meshData.quaternion : [];
+    const scale = Array.isArray(meshData?.scale) ? meshData.scale : [];
+    if (pos.length === 3) mesh.position.set(Number(pos[0]), Number(pos[1]), Number(pos[2]));
+    if (quat.length === 4) mesh.quaternion.set(Number(quat[0]), Number(quat[1]), Number(quat[2]), Number(quat[3]));
+    if (scale.length === 3) mesh.scale.set(Number(scale[0]), Number(scale[1]), Number(scale[2]));
+
+    group.add(mesh);
+  }
+
+  return group.children.length > 0 ? group : null;
+}
+
+async function trimPersistentMeshCache(db) {
+  try {
+    const tx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readonly");
+    const store = tx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+    const all = await idbRequestToPromise(store.getAll());
+    await waitForTransaction(tx);
+    if (!Array.isArray(all) || all.length === 0) return;
+
+    const sorted = all
+      .slice()
+      .sort((a, b) => Number(b?.updatedAt || 0) - Number(a?.updatedAt || 0));
+
+    const keysToDelete = new Set();
+    if (sorted.length > DXF_MESH_CACHE_MAX_ENTRIES) {
+      for (const rec of sorted.slice(DXF_MESH_CACHE_MAX_ENTRIES)) {
+        if (rec?.key) keysToDelete.add(rec.key);
+      }
+    }
+
+    let totalBytes = 0;
+    for (const rec of sorted) totalBytes += Number(rec?.approxBytes || 0);
+    if (totalBytes > DXF_MESH_CACHE_MAX_BYTES) {
+      for (let i = sorted.length - 1; i >= 0 && totalBytes > DXF_MESH_CACHE_MAX_BYTES; i -= 1) {
+        const rec = sorted[i];
+        if (!rec?.key || keysToDelete.has(rec.key)) continue;
+        keysToDelete.add(rec.key);
+        totalBytes -= Number(rec?.approxBytes || 0);
+      }
+    }
+
+    if (keysToDelete.size === 0) return;
+
+    const writeTx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readwrite");
+    const writeStore = writeTx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+    for (const key of keysToDelete) writeStore.delete(key);
+    await waitForTransaction(writeTx);
+  } catch (_error) {
+    // no-op
+  }
+}
+
+async function getMeshGroupFromPersistentCache(cacheKey, fallbackName = "") {
+  if (!cacheKey) return null;
+  const db = await openDxfCacheDb();
+  if (!db) return null;
+
+  try {
+    const tx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readonly");
+    const store = tx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+    const record = await idbRequestToPromise(store.get(cacheKey));
+    await waitForTransaction(tx);
+    if (!record?.snapshot) return null;
+
+    const group = buildGroupFromMeshSnapshot(record.snapshot, fallbackName || record.fileName || "");
+    if (!group) return null;
+
+    try {
+      const writeTx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readwrite");
+      const writeStore = writeTx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+      writeStore.put({
+        ...record,
+        hits: Number(record.hits || 0) + 1,
+        updatedAt: Date.now()
+      });
+    } catch (_touchError) {
+      // no-op
+    }
+
+    return group;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function putMeshGroupInPersistentCache(cacheKey, localGroup, file, thickness) {
+  if (!cacheKey || !localGroup) return false;
+  const db = await openDxfCacheDb();
+  if (!db) return false;
+
+  const snapshot = serializeMeshGroupSnapshot(localGroup, thickness);
+  if (!snapshot) return false;
+
+  const now = Date.now();
+  const record = {
+    key: cacheKey,
+    snapshot,
+    approxBytes: estimateMeshSnapshotBytes(snapshot),
+    fileName: String(file?.name || ""),
+    fileSize: Number(file?.size || 0),
+    thickness: Number(thickness),
+    createdAt: now,
+    updatedAt: now,
+    hits: 0
+  };
+
+  try {
+    const tx = db.transaction(DXF_MESH_CACHE_STORE_NAME, "readwrite");
+    const store = tx.objectStore(DXF_MESH_CACHE_STORE_NAME);
+    store.put(record);
+    await waitForTransaction(tx);
+    await trimPersistentMeshCache(db);
+    return true;
+  } catch (_error) {
+    return false;
   }
 }
 
@@ -2601,7 +3149,15 @@ function finalizeImportedGroup(localGroup, autoCenter) {
   return true;
 }
 
-function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue = null, preParsed = null) {
+function addDxfToScene(
+  dxfText,
+  filename,
+  thickness,
+  autoCenter = true,
+  onIssue = null,
+  preParsed = null,
+  onBuiltGroup = null
+) {
   const material = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setHSL(Math.random(), 0.6, 0.55),
     metalness: 0.05,
@@ -2623,7 +3179,10 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
       onIssue,
       preParsed
     );
-    if (okCnc) return finalizeImportedGroup(localGroup, autoCenter);
+    if (okCnc) {
+      if (typeof onBuiltGroup === "function") onBuiltGroup(localGroup);
+      return finalizeImportedGroup(localGroup, autoCenter);
+    }
   } catch (error) {
     console.warn("Fallback para parser DXF padrao em:", filename, error);
   }
@@ -2828,63 +3387,8 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
     );
     return false;
   }
+  if (typeof onBuiltGroup === "function") onBuiltGroup(localGroup);
   return finalizeImportedGroup(localGroup, autoCenter);
-}
-
-function decodeBase64ToArrayBuffer(base64Data) {
-  const raw = String(base64Data || "").replace(/^data:.*?;base64,/, "");
-  const bin = atob(raw);
-  const len = bin.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i += 1) bytes[i] = bin.charCodeAt(i);
-  return bytes.buffer;
-}
-
-function parseGlbArrayBuffer(arrayBuffer) {
-  return new Promise((resolve, reject) => {
-    gltfLoader.parse(
-      arrayBuffer,
-      "",
-      (gltf) => resolve(gltf),
-      (error) => reject(error || new Error("Falha ao parsear GLB"))
-    );
-  });
-}
-
-async function addGlbToScene(arrayBuffer, filename, autoCenter = true, onIssue = null) {
-  let gltf;
-  try {
-    gltf = await parseGlbArrayBuffer(arrayBuffer);
-  } catch (error) {
-    console.error("Falha ao parsear GLB:", filename, error);
-    reportImportIssue(onIssue, `Falha ao abrir GLB convertido de ${filename}.`);
-    return false;
-  }
-
-  const rootScene = gltf?.scene || (Array.isArray(gltf?.scenes) ? gltf.scenes[0] : null);
-  if (!rootScene) {
-    reportImportIssue(onIssue, `Resposta GLB invalida para ${filename}.`);
-    return false;
-  }
-
-  const localGroup = new THREE.Group();
-  localGroup.name = filename;
-  localGroup.add(rootScene);
-  return finalizeImportedGroup(localGroup, autoCenter);
-}
-
-const serverModeFallbackLogged = new Set();
-
-function logServerFallbackOnce(reason = "") {
-  const key = String(reason || "generic");
-  if (serverModeFallbackLogged.has(key)) return;
-  serverModeFallbackLogged.add(key);
-  if (reason) console.warn("[server-glb fallback]", reason);
-}
-
-function looksLikeHtmlBody(text) {
-  const t = String(text || "").trim().toLowerCase();
-  return t.startsWith("<!doctype html") || t.startsWith("<html") || t.includes("<head");
 }
 
 async function importSingleFileBrowserPipeline(
@@ -2892,147 +3396,109 @@ async function importSingleFileBrowserPipeline(
   thickness,
   autoCenter = true,
   onIssue = null,
-  workerPool = null
+  workerPool = null,
+  onCacheEvent = null
 ) {
-  let text = "";
+  let fileBuffer = null;
+  let dxfHash = "";
+  let meshCacheKey = "";
+  let parseCacheKey = "";
+  let preParsed = null;
+
   try {
-    text = await decodeDxfFile(file);
+    fileBuffer = await file.arrayBuffer();
   } catch (decodeError) {
     console.error("Falha inesperada no decode:", file?.name, decodeError);
     reportImportIssue(onIssue, `Falha inesperada ao ler ${file?.name || "arquivo"}. Veja o console (F12).`);
     return false;
   }
 
-  const pool = workerPool ?? getDxfWorkerPool();
-  const preParsed = pool ? await parseDxfWithWorkers(text, file?.name || "") : null;
+  try {
+    dxfHash = await computeArrayBufferHashHex(fileBuffer);
+    parseCacheKey = buildParsedCacheKeyFromHash(dxfHash);
+    meshCacheKey = buildMeshCacheKeyFromHash(dxfHash, thickness);
+  } catch (_hashError) {
+    parseCacheKey = "";
+    meshCacheKey = "";
+  }
+
+  if (meshCacheKey) {
+    const cachedGroup = await getMeshGroupFromPersistentCache(meshCacheKey, file?.name || "");
+    if (cachedGroup) {
+      if (typeof onCacheEvent === "function") {
+        onCacheEvent({ type: "mesh-hit", fileName: file?.name || "" });
+      }
+      return finalizeImportedGroup(cachedGroup, autoCenter);
+    }
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: "mesh-miss", fileName: file?.name || "" });
+    }
+  }
+
+  let text = "";
+  try {
+    text = decodeDxfArrayBuffer(fileBuffer, file?.name || "");
+  } catch (decodeError) {
+    console.error("Falha inesperada no decode:", file?.name, decodeError);
+    reportImportIssue(onIssue, `Falha inesperada ao ler ${file?.name || "arquivo"}. Veja o console (F12).`);
+    return false;
+  }
 
   try {
-    return addDxfToScene(
+    if (!parseCacheKey) {
+      parseCacheKey = await buildParsedCacheKey(fileBuffer);
+    }
+    preParsed = await getParsedFromPersistentCache(parseCacheKey);
+    if (preParsed && !dxfCacheInitLogged) {
+      dxfCacheInitLogged = true;
+      console.info("Cache DXF persistente ativo (IndexedDB).");
+    }
+    if (preParsed && typeof onCacheEvent === "function") {
+      onCacheEvent({ type: "parse-hit", fileName: file?.name || "" });
+    }
+  } catch (_cacheError) {
+    preParsed = null;
+  }
+
+  if (!preParsed) {
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: "parse-miss", fileName: file?.name || "" });
+    }
+    const pool = workerPool ?? getDxfWorkerPool();
+    preParsed = pool ? await parseDxfWithWorkers(text, file?.name || "") : null;
+    if (preParsed && parseCacheKey) {
+      const persisted = await putParsedInPersistentCache(parseCacheKey, preParsed, file);
+      if (typeof onCacheEvent === "function") {
+        onCacheEvent({ type: persisted ? "parse-save" : "parse-save-failed", fileName: file?.name || "" });
+      }
+    }
+  }
+
+  let builtGroupForCache = null;
+  try {
+    const imported = addDxfToScene(
       text,
       file?.name || "arquivo.dxf",
       thickness,
       autoCenter,
       onIssue,
-      preParsed
+      preParsed,
+      (localGroup) => {
+        builtGroupForCache = localGroup;
+      }
     );
+    if (imported && builtGroupForCache && meshCacheKey) {
+      const persistedMesh = await putMeshGroupInPersistentCache(meshCacheKey, builtGroupForCache, file, thickness);
+      if (typeof onCacheEvent === "function") {
+        onCacheEvent({ type: persistedMesh ? "mesh-save" : "mesh-save-failed", fileName: file?.name || "" });
+      }
+    }
+    return imported;
   } catch (error) {
     console.error("Falha inesperada ao importar:", file?.name, error);
     reportImportIssue(onIssue, `Falha inesperada ao importar ${file?.name || "arquivo"}. Veja o console (F12).`);
     return false;
   }
-}
-
-async function addDxfToSceneViaServerGlb(file, thickness, autoCenter = true, onIssue = null) {
-  const endpoint = "/api/convert-dxf-glb";
-  const formData = new FormData();
-  formData.append("file", file, file?.name || "piece.dxf");
-  formData.append("thickness", String(thickness));
-
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method: "POST",
-      body: formData
-    });
-  } catch (error) {
-    console.error("Falha de rede no endpoint GLB:", error);
-    logServerFallbackOnce(
-      `Endpoint ${endpoint} sem resposta; usando pipeline browser para ${file?.name || "arquivo"}.`
-    );
-    return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
-  }
-
-  if (!response.ok) {
-    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-    let body = "";
-    try {
-      body = await response.text();
-    } catch (_e) {
-      body = "";
-    }
-
-    const unsupportedApi =
-      response.status === 404 ||
-      response.status === 405 ||
-      response.status === 501 ||
-      contentType.includes("text/html") ||
-      looksLikeHtmlBody(body);
-
-    if (unsupportedApi) {
-      logServerFallbackOnce(
-        `Endpoint ${endpoint} nao ativo (status ${response.status}); ` +
-        `usando pipeline browser para ${file?.name || "arquivo"}.`
-      );
-      return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
-    }
-
-    const trimmed = String(body || "").replace(/\s+/g, " ").trim();
-    const detail = trimmed && !looksLikeHtmlBody(trimmed) ? ` ${trimmed.slice(0, 180)}` : "";
-    reportImportIssue(onIssue, `Falha ao converter ${file?.name || "arquivo"} no servidor (${response.status}).${detail}`);
-    return false;
-  }
-
-  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-  if (contentType.includes("text/html")) {
-    logServerFallbackOnce(
-      `Resposta HTML inesperada do endpoint ${endpoint}; ` +
-      `usando pipeline browser para ${file?.name || "arquivo"}.`
-    );
-    return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
-  }
-
-  let glbBuffer = null;
-  let serverWarnings = [];
-
-  if (contentType.includes("application/json")) {
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch (error) {
-      reportImportIssue(onIssue, `Resposta JSON invalida do servidor para ${file?.name || "arquivo"}.`);
-      return false;
-    }
-
-    if (Array.isArray(payload?.warnings)) serverWarnings = payload.warnings;
-    if (payload?.warning) serverWarnings.push(String(payload.warning));
-    if (payload?.error) {
-      reportImportIssue(onIssue, `Servidor retornou erro em ${file?.name || "arquivo"}: ${payload.error}`);
-      return false;
-    }
-
-    if (payload?.glbBase64) {
-      glbBuffer = decodeBase64ToArrayBuffer(payload.glbBase64);
-    } else if (payload?.glbUrl) {
-      try {
-        const glbResponse = await fetch(String(payload.glbUrl));
-        if (!glbResponse.ok) {
-          reportImportIssue(
-            onIssue,
-            `Nao foi possivel baixar GLB gerado para ${file?.name || "arquivo"} (${glbResponse.status}).`
-          );
-          return false;
-        }
-        glbBuffer = await glbResponse.arrayBuffer();
-      } catch (error) {
-        reportImportIssue(onIssue, `Falha ao baixar GLB gerado para ${file?.name || "arquivo"}.`);
-        return false;
-      }
-    } else {
-      reportImportIssue(
-        onIssue,
-        `Resposta JSON sem GLB para ${file?.name || "arquivo"} (esperado glbBase64 ou glbUrl).`
-      );
-      return false;
-    }
-  } else {
-    glbBuffer = await response.arrayBuffer();
-  }
-
-  for (const warning of serverWarnings) {
-    reportImportIssue(onIssue, `[servidor] ${String(warning)}`);
-  }
-
-  return addGlbToScene(glbBuffer, file?.name || "arquivo.dxf", autoCenter, onIssue);
 }
 
 function updateGlobalBounds() {
@@ -3074,26 +3540,12 @@ const fitBtn = document.getElementById("fitBtn");
 const clearBtn = document.getElementById("clearBtn");
 const pieceCountEl = document.getElementById("pieceCount");
 const batchTimeEl = document.getElementById("batchTime");
+const cacheStatsEl = document.getElementById("cacheStats");
 const selectedPieceEl = document.getElementById("selectedPiece");
-const IMPORT_MODE_STORAGE_KEY = "dxfViewer.importMode";
 const IMPORT_MODE_BROWSER = "browser";
-const IMPORT_MODE_SERVER_GLB = "server-glb";
-
-function normalizeImportMode(mode) {
-  return mode === IMPORT_MODE_SERVER_GLB ? IMPORT_MODE_SERVER_GLB : IMPORT_MODE_BROWSER;
-}
-
-function getSelectedImportMode() {
-  return normalizeImportMode(importModeEl?.value || IMPORT_MODE_BROWSER);
-}
 
 if (importModeEl) {
-  const savedMode = normalizeImportMode(localStorage.getItem(IMPORT_MODE_STORAGE_KEY));
-  importModeEl.value = savedMode;
-  importModeEl.addEventListener("change", () => {
-    const mode = getSelectedImportMode();
-    localStorage.setItem(IMPORT_MODE_STORAGE_KEY, mode);
-  });
+  importModeEl.value = IMPORT_MODE_BROWSER;
 }
 
 function updatePieceCountBadge() {
@@ -3105,6 +3557,26 @@ function updateBatchTimeBadge(ms) {
   if (!batchTimeEl) return;
   const value = Number.isFinite(ms) ? Math.max(0, Math.round(ms)) : 0;
   batchTimeEl.textContent = `Tempo: ${value} ms`;
+}
+
+function updateCacheStatsBadge(stats = null) {
+  if (!cacheStatsEl) return;
+  if (!stats) {
+    cacheStatsEl.textContent = "Cache: -";
+    return;
+  }
+
+  const meshHits = Number(stats.meshHits || 0);
+  const meshMisses = Number(stats.meshMisses || 0);
+  const meshSaves = Number(stats.meshSaves || 0);
+  const parseHits = Number(stats.parseHits || 0);
+  const parseMisses = Number(stats.parseMisses || 0);
+  const parseSaves = Number(stats.parseSaves || 0);
+  const errors = Number(stats.errors || 0);
+
+  cacheStatsEl.textContent =
+    `Cache M:${meshHits}/${meshMisses}/${meshSaves} P:${parseHits}/${parseMisses}/${parseSaves}` +
+    (errors > 0 ? ` ERR:${errors}` : "");
 }
 
 function formatPieceLabel(name) {
@@ -3122,25 +3594,30 @@ function updateSelectedPieceBadge(name) {
 
 updatePieceCountBadge();
 updateBatchTimeBadge(0);
+updateCacheStatsBadge(null);
 updateSelectedPieceBadge(null);
 
-async function decodeDxfFile(file) {
-  let text = await file.text();
+function decodeDxfArrayBuffer(arrayBuffer, filename = "") {
+  let text = "";
+  try {
+    text = new TextDecoder("utf-8").decode(arrayBuffer);
+  } catch (decodeUtf8Error) {
+    console.warn("Falha no decode utf-8 para:", filename, decodeUtf8Error);
+  }
+
   if (text.includes("\u0000")) {
     try {
-      const buf = await file.arrayBuffer();
-      text = new TextDecoder("utf-16le").decode(buf);
+      text = new TextDecoder("utf-16le").decode(arrayBuffer);
     } catch (decodeUtf16Error) {
-      console.warn("Falha no decode utf-16le para:", file?.name, decodeUtf16Error);
+      console.warn("Falha no decode utf-16le para:", filename, decodeUtf16Error);
     }
   }
 
   if (!/SECTION/i.test(String(text).slice(0, 1200))) {
     try {
-      const buf = await file.arrayBuffer();
-      text = new TextDecoder("latin1").decode(buf);
-    } catch (decodeError) {
-      console.warn("Falha no decode latin1 para:", file?.name, decodeError);
+      text = new TextDecoder("latin1").decode(arrayBuffer);
+    } catch (decodeLatin1Error) {
+      console.warn("Falha no decode latin1 para:", filename, decodeLatin1Error);
     }
   }
 
@@ -3152,51 +3629,51 @@ fileInput.addEventListener("change", async (ev) => {
   if (files.length === 0) return;
 
   const importStart = performance.now();
-  const importMode = getSelectedImportMode();
   const thickness = Number(thicknessEl.value || 5);
   const autoCenter = !!autoCenterEl.checked;
   const importIssues = [];
+  const cacheStats = {
+    meshHits: 0,
+    meshMisses: 0,
+    meshSaves: 0,
+    parseHits: 0,
+    parseMisses: 0,
+    parseSaves: 0,
+    errors: 0
+  };
   let importedCount = 0;
+  const workerPool = getDxfWorkerPool();
+  updateCacheStatsBadge(cacheStats);
 
-  if (importMode === IMPORT_MODE_SERVER_GLB) {
-    for (const f of files) {
-      try {
-        const ok = await addDxfToSceneViaServerGlb(
-          f,
-          thickness,
-          autoCenter,
-          (msg) => importIssues.push(msg)
-        );
-        if (ok) importedCount += 1;
-      } catch (error) {
-        console.error("Falha inesperada no modo servidor GLB:", f?.name, error);
-        importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"} no modo servidor.`);
-      } finally {
-        updateBatchTimeBadge(performance.now() - importStart);
-      }
+  await Promise.all(files.map(async (f) => {
+    try {
+      const ok = await importSingleFileBrowserPipeline(
+        f,
+        thickness,
+        autoCenter,
+        (msg) => importIssues.push(msg),
+        workerPool,
+        (event) => {
+          const type = String(event?.type || "");
+          if (type === "mesh-hit") cacheStats.meshHits += 1;
+          else if (type === "mesh-miss") cacheStats.meshMisses += 1;
+          else if (type === "mesh-save") cacheStats.meshSaves += 1;
+          else if (type === "parse-hit") cacheStats.parseHits += 1;
+          else if (type === "parse-miss") cacheStats.parseMisses += 1;
+          else if (type === "parse-save") cacheStats.parseSaves += 1;
+          else if (type.endsWith("-failed")) cacheStats.errors += 1;
+          updateCacheStatsBadge(cacheStats);
+        }
+      );
+      if (ok) importedCount += 1;
+    } catch (error) {
+      console.error("Falha inesperada no modo browser DXF:", f?.name, error);
+      importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
+    } finally {
+      // Atualiza o tempo enquanto o lote ainda esta processando.
+      updateBatchTimeBadge(performance.now() - importStart);
     }
-  } else {
-    const workerPool = getDxfWorkerPool();
-
-    await Promise.all(files.map(async (f) => {
-      try {
-        const ok = await importSingleFileBrowserPipeline(
-          f,
-          thickness,
-          autoCenter,
-          (msg) => importIssues.push(msg),
-          workerPool
-        );
-        if (ok) importedCount += 1;
-      } catch (error) {
-        console.error("Falha inesperada no modo browser DXF:", f?.name, error);
-        importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
-      } finally {
-        // Atualiza o tempo enquanto o lote ainda esta processando.
-        updateBatchTimeBadge(performance.now() - importStart);
-      }
-    }));
-  }
+  }));
 
   const importDurationMs = performance.now() - importStart;
   updateBatchTimeBadge(importDurationMs);
@@ -3211,10 +3688,10 @@ fileInput.addEventListener("change", async (ev) => {
       const body = shownIssues.map((msg, idx) => `${idx + 1}. ${msg}`).join("\n");
       const suffix = moreCount > 0 ? `\n... e mais ${moreCount} aviso(s).` : "";
       alert(`Nenhuma peca valida foi importada.\n\n${body}${suffix}`);
-    } else {
-      alert(
-        `Importacao concluida: ${importedCount}/${files.length} arquivo(s) importado(s). ` +
-        `${uniqueIssues.length} arquivo(s) com aviso foram ignorados.`
+    } else if (console && typeof console.info === "function") {
+      console.info(
+        `Importacao concluida com aviso(s): ${importedCount}/${files.length} arquivo(s) importado(s), ` +
+        `${uniqueIssues.length} aviso(s).`
       );
     }
   }
