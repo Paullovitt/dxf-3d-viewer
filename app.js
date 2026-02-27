@@ -1055,7 +1055,8 @@ function readRecord(pairs, start) {
   return { type, fields, next: i };
 }
 
-function parseDxfAsciiCnc(text) {
+function parseDxfAsciiCnc(text, options = {}) {
+  const preferSimple = !!options.preferSimple;
   const lines = String(text || "").replace(/\r/g, "").split("\n");
   const pairs = [];
   for (let i = 0; i + 1 < lines.length; i += 2) {
@@ -1226,6 +1227,9 @@ function parseDxfAsciiCnc(text) {
     i = rec.next;
   }
 
+  if (preferSimple) {
+    return normalizeContoursSimple(contours) || normalizeContoursCnc(contours);
+  }
   return normalizeContoursCnc(contours) || normalizeContoursSimple(contours);
 }
 
@@ -1315,9 +1319,10 @@ function compactLoopPoints(points, tol) {
 }
 
 function stitchClosedLoopsFromOpenContours(openContours, tol) {
+  const dedupTol = Math.max(1e-5, Math.min(0.08, Number(tol || 0) * 0.05));
   const pool = [];
   for (const contour of (openContours || [])) {
-    const pts = compactLoopPoints(contour, tol * 0.5);
+    const pts = compactLoopPoints(contour, dedupTol);
     if (pts.length >= 2) pool.push({ points: pts, used: false });
   }
   const loops = [];
@@ -1373,11 +1378,59 @@ function stitchClosedLoopsFromOpenContours(openContours, tol) {
       }
     }
 
-    const loop = compactLoopPoints(chain, tol * 0.5);
+    const loop = compactLoopPoints(chain, dedupTol);
     if (loop.length >= 3) loops.push(loop);
   }
 
   return loops;
+}
+
+function findDominantOuterLoopFromOpenContours(openContours, sourceArea, minSideHint = 0) {
+  if (!Array.isArray(openContours) || openContours.length < 2) return null;
+  if (!(Number(sourceArea) > EPS)) return null;
+
+  const safeMinSide = Number.isFinite(minSideHint) && minSideHint > 0
+    ? minSideHint
+    : Math.sqrt(sourceArea);
+
+  const tolSet = new Set([
+    0.6, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20
+  ]);
+  for (const raw of [
+    safeMinSide * 0.004,
+    safeMinSide * 0.006,
+    safeMinSide * 0.008,
+    safeMinSide * 0.012,
+    safeMinSide * 0.016,
+    safeMinSide * 0.02,
+    safeMinSide * 0.03
+  ]) {
+    const tol = Number(raw);
+    if (!Number.isFinite(tol) || tol <= 0) continue;
+    tolSet.add(Math.min(20, Math.max(0.6, Number(tol.toFixed(3)))));
+  }
+
+  const tolerances = [...tolSet].sort((a, b) => a - b);
+  let bestLoop = null;
+  let bestArea = 0;
+
+  for (const tol of tolerances) {
+    const loops = stitchClosedLoopsFromOpenContours(openContours, tol);
+    for (const loop of loops) {
+      const closedPts = buildClosedPointList(loop);
+      if (!closedPts || closedPts.length < 4) continue;
+      const openPts = closedPts.slice(0, -1);
+      const area = Math.abs(polygonAreaSigned(openPts));
+      if (!(area > bestArea + 1e-8)) continue;
+      if (area > sourceArea * 1.2) continue;
+      bestArea = area;
+      bestLoop = openPts.map((p) => p.clone());
+    }
+    if (bestArea >= sourceArea * 0.75) break;
+  }
+
+  if (!(bestArea >= sourceArea * 0.45)) return null;
+  return bestLoop;
 }
 
 function polygonAreaSigned(openPts) {
@@ -1535,6 +1588,13 @@ function circleToLoopPoints(center, radius, segments = 72) {
 function choosePrimarySelectionLoop(closedLoops, allPoints) {
   let bestLoop = null;
   let bestArea = 0;
+  let sourceBounds = null;
+  let sourceArea = 0;
+
+  if (Array.isArray(allPoints) && allPoints.length >= 3) {
+    sourceBounds = computePointCloudBounds(allPoints);
+    sourceArea = Number(sourceBounds?.area || 0);
+  }
 
   for (const loop of (closedLoops || [])) {
     if (!Array.isArray(loop) || loop.length < 3) continue;
@@ -1547,6 +1607,15 @@ function choosePrimarySelectionLoop(closedLoops, allPoints) {
   if (bestLoop && bestLoop.length >= 3) {
     return bestLoop.map((p) => new THREE.Vector2(Number(p?.x), Number(p?.y)))
       .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+  }
+
+  if (bestLoop && sourceArea > 1e-8) {
+    const ratio = bestArea / sourceArea;
+    // Avoid selecting thin border-strip loops as primary outline.
+    if (ratio < 0.35) {
+      const hullFallback = convexHullFromPoints(allPoints || []);
+      if (Array.isArray(hullFallback) && hullFallback.length >= 3) return hullFallback;
+    }
   }
 
   const hull = convexHullFromPoints(allPoints || []);
@@ -1564,28 +1633,225 @@ function assignSelectionOutlineData(localGroup, closedLoops, allPoints) {
   localGroup.userData.selectionPrimaryLoop = loop.map((p) => new THREE.Vector2(p.x, p.y));
 }
 
+function assignSelectionOutlineDataFromShapes(localGroup, shapes, closedLoops, allPoints) {
+  if (!localGroup) return;
+
+  let bestLoop = null;
+  let bestArea = 0;
+  for (const shape of (shapes || [])) {
+    if (!shape || typeof shape.getPoints !== "function") continue;
+    const pts = shape.getPoints(320)
+      .map((p) => new THREE.Vector2(Number(p?.x), Number(p?.y)))
+      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+    if (pts.length < 3) continue;
+    if (pts[0].distanceTo(pts[pts.length - 1]) <= 1e-9) pts.pop();
+    if (pts.length < 3) continue;
+
+    const area = Math.abs(polygonAreaSigned(pts));
+    if (!(area > bestArea + 1e-8)) continue;
+    bestArea = area;
+    bestLoop = pts;
+  }
+
+  if (bestLoop && bestLoop.length >= 3) {
+    localGroup.userData.selectionPrimaryLoop = bestLoop.map((p) => new THREE.Vector2(p.x, p.y));
+    return;
+  }
+
+  assignSelectionOutlineData(localGroup, closedLoops, allPoints);
+}
+
+function computePointCloudBounds(points) {
+  const pts = (points || []).filter((p) => Number.isFinite(p?.x) && Number.isFinite(p?.y));
+  if (!pts.length) return null;
+
+  let minX = pts[0].x;
+  let minY = pts[0].y;
+  let maxX = pts[0].x;
+  let maxY = pts[0].y;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
+  }
+
+  const width = Math.max(0, maxX - minX);
+  const height = Math.max(0, maxY - minY);
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    width,
+    height,
+    area: Math.max(1e-8, width * height)
+  };
+}
+
+function shouldForceHullFromTinyClosedLoops(closedLoops, sourceArea, openEntityCount, stitchedLoopCount) {
+  if (!(Number(sourceArea) > 1e-8)) return false;
+  if (Number(openEntityCount) < 2) return false;
+  if (Number(stitchedLoopCount) < 2) return false;
+  if (!Array.isArray(closedLoops) || closedLoops.length < 4) return false;
+
+  const tinyAreaThreshold = sourceArea * 0.0035;
+  const largeAreaThreshold = sourceArea * 0.02;
+  let validLoopCount = 0;
+  let tinyCount = 0;
+  let largeCount = 0;
+
+  for (const loop of closedLoops) {
+    if (!Array.isArray(loop) || loop.length < 3) continue;
+    const area = Math.abs(polygonAreaSigned(loop));
+    if (!(area > 1e-8)) continue;
+    validLoopCount += 1;
+    if (area <= tinyAreaThreshold) tinyCount += 1;
+    if (area >= largeAreaThreshold) largeCount += 1;
+  }
+
+  if (validLoopCount < 4) return false;
+  if (largeCount > 0) return false;
+  return tinyCount >= Math.min(6, validLoopCount);
+}
+
+function collectTinyClosedLoops(closedLoops, sourceArea) {
+  if (!Array.isArray(closedLoops) || !(Number(sourceArea) > 1e-8)) return [];
+  const tinyAreaThreshold = sourceArea * 0.0035;
+  const out = [];
+  for (const loop of closedLoops) {
+    if (!Array.isArray(loop) || loop.length < 3) continue;
+    const area = Math.abs(polygonAreaSigned(loop));
+    if (!(area > 1e-8) || area > tinyAreaThreshold) continue;
+    out.push(loop.map((p) => new THREE.Vector2(Number(p?.x), Number(p?.y))));
+  }
+  return out;
+}
+
 function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
   const allowHullFallback = options.allowHullFallback !== false;
-  const loops = [];
-  for (const loop of (closedLoops || [])) {
-    const closedPts = buildClosedPointList(loop);
-    if (!closedPts || closedPts.length < 4) continue;
-    const openPts = closedPts.slice(0, -1);
-    const areaAbs = Math.abs(polygonAreaSigned(openPts));
-    if (!(areaAbs > 1e-8)) continue;
+  const forceHullFromTinyClosed = !!options.forceHullFromTinyClosed;
+  function splitCompoundLoopCandidates(openPts) {
+    if (!Array.isArray(openPts) || openPts.length < 4) return [openPts];
 
     let minX = openPts[0].x;
     let minY = openPts[0].y;
     let maxX = openPts[0].x;
     let maxY = openPts[0].y;
-    for (const p of openPts) {
+    let hasRepeatKey = false;
+    const seen = new Map();
+    const repeatTol = 1e-4;
+
+    for (let i = 0; i < openPts.length; i += 1) {
+      const p = openPts[i];
       minX = Math.min(minX, p.x);
       minY = Math.min(minY, p.y);
       maxX = Math.max(maxX, p.x);
       maxY = Math.max(maxY, p.y);
+
+      const key = pointKey(p, repeatTol);
+      const prev = seen.get(key);
+      const isNonAdjacentRepeat = prev !== undefined && (i - prev > 1);
+      if (isNonAdjacentRepeat) hasRepeatKey = true;
+      if (prev === undefined) seen.set(key, i);
     }
 
-    loops.push({
+    const areaAbs = Math.abs(polygonAreaSigned(openPts));
+    const bboxArea = Math.max(EPS, (maxX - minX) * (maxY - minY));
+    const areaRatio = areaAbs / bboxArea;
+    const suspicious = hasRepeatKey || areaRatio > 1.08 || areaRatio < 0.42;
+    if (!suspicious) return [openPts];
+
+    const segs = [];
+    const seq = [...openPts, openPts[0]];
+    appendSegmentsFromPointList(seq, segs);
+    let subLoops = extractClosedLoopsFromSegments(segs, 1e-4);
+    if (subLoops.length < 2) subLoops = extractClosedLoopsFromSegments(segs, 5e-4);
+    if (subLoops.length < 2) return [openPts];
+
+    const candidates = [];
+    for (const loopPts of subLoops) {
+      const shapeInfo = buildShapeInfoFromPoints(loopPts);
+      if (!shapeInfo) continue;
+      const loopOpen = shapeInfo.outline.slice(0, -1);
+      if (loopOpen.length < 3) continue;
+      const loopArea = Math.abs(polygonAreaSigned(loopOpen));
+      if (!(loopArea > 1e-8)) continue;
+
+      let lx0 = loopOpen[0].x;
+      let ly0 = loopOpen[0].y;
+      let lx1 = loopOpen[0].x;
+      let ly1 = loopOpen[0].y;
+      for (const p of loopOpen) {
+        lx0 = Math.min(lx0, p.x);
+        ly0 = Math.min(ly0, p.y);
+        lx1 = Math.max(lx1, p.x);
+        ly1 = Math.max(ly1, p.y);
+      }
+      const w = Math.max(EPS, lx1 - lx0);
+      const h = Math.max(EPS, ly1 - ly0);
+      candidates.push({
+        loopOpen,
+        area: loopArea,
+        cx: (lx0 + lx1) * 0.5,
+        cy: (ly0 + ly1) * 0.5,
+        minDim: Math.min(w, h)
+      });
+    }
+    if (!candidates.length) return [openPts];
+
+    const minDimMedian = [...candidates]
+      .map((x) => x.minDim)
+      .sort((a, b) => a - b)[Math.floor(candidates.length * 0.5)];
+    const quant = Math.max(1e-4, Math.min(0.5, minDimMedian * 0.15));
+
+    // Some DXFs encode the same hole as concentric/stacked loops in one path.
+    // Keep only one loop per hole center (largest area) to avoid fake filled patches.
+    const bestByCenter = new Map();
+    for (const c of candidates) {
+      const key = `${Math.round(c.cx / quant)}_${Math.round(c.cy / quant)}`;
+      const prev = bestByCenter.get(key);
+      if (!prev || c.area > prev.area) bestByCenter.set(key, c);
+    }
+
+    const normalized = [...bestByCenter.values()]
+      .sort((a, b) => b.area - a.area)
+      .map((x) => x.loopOpen);
+    return normalized.length ? normalized : [openPts];
+  }
+
+  function makeLoopRecord(openPts, bboxHint = null) {
+    if (!Array.isArray(openPts) || openPts.length < 3) return null;
+    const areaAbs = Math.abs(polygonAreaSigned(openPts));
+    if (!(areaAbs > 1e-8)) return null;
+
+    let minX;
+    let minY;
+    let maxX;
+    let maxY;
+
+    if (bboxHint) {
+      minX = Number(bboxHint.minX);
+      minY = Number(bboxHint.minY);
+      maxX = Number(bboxHint.maxX);
+      maxY = Number(bboxHint.maxY);
+    } else {
+      minX = openPts[0].x;
+      minY = openPts[0].y;
+      maxX = openPts[0].x;
+      maxY = openPts[0].y;
+      for (const p of openPts) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+
+    const closedPts = buildClosedPointList(openPts);
+    if (!closedPts || closedPts.length < 4) return null;
+
+    return {
       openPts,
       closedPts,
       areaAbs,
@@ -1593,76 +1859,256 @@ function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
       sample: pickSampleInside(openPts, closedPts),
       parent: -1,
       depth: -1
-    });
+    };
+  }
+
+  const loops = [];
+  for (const loop of (closedLoops || [])) {
+    const closedPts = buildClosedPointList(loop);
+    if (!closedPts || closedPts.length < 4) continue;
+    const openPts = closedPts.slice(0, -1);
+    const loopCandidates = splitCompoundLoopCandidates(openPts);
+    for (const candidate of loopCandidates) {
+      const rec = makeLoopRecord(candidate);
+      if (rec) loops.push(rec);
+    }
   }
   if (!loops.length) return [];
 
   const sourcePts = (allPoints || []).filter((p) => Number.isFinite(p?.x) && Number.isFinite(p?.y));
-  if (allowHullFallback && sourcePts.length >= 3) {
-    let minX = sourcePts[0].x;
-    let minY = sourcePts[0].y;
-    let maxX = sourcePts[0].x;
-    let maxY = sourcePts[0].y;
+  let sourceMinX = 0;
+  let sourceMinY = 0;
+  let sourceMaxX = 0;
+  let sourceMaxY = 0;
+  let sourceBBoxArea = 0;
+  let hasSourceBBox = false;
+
+  if (sourcePts.length >= 3) {
+    sourceMinX = sourcePts[0].x;
+    sourceMinY = sourcePts[0].y;
+    sourceMaxX = sourcePts[0].x;
+    sourceMaxY = sourcePts[0].y;
     for (const p of sourcePts) {
-      minX = Math.min(minX, p.x);
-      minY = Math.min(minY, p.y);
-      maxX = Math.max(maxX, p.x);
-      maxY = Math.max(maxY, p.y);
+      sourceMinX = Math.min(sourceMinX, p.x);
+      sourceMinY = Math.min(sourceMinY, p.y);
+      sourceMaxX = Math.max(sourceMaxX, p.x);
+      sourceMaxY = Math.max(sourceMaxY, p.y);
     }
-    const bboxArea = Math.max(1e-8, (maxX - minX) * (maxY - minY));
+    sourceBBoxArea = Math.max(1e-8, (sourceMaxX - sourceMinX) * (sourceMaxY - sourceMinY));
+    hasSourceBBox = true;
+  }
+
+  if (forceHullFromTinyClosed && hasSourceBBox && sourcePts.length >= 3) {
+    const tinyThreshold = sourceBBoxArea * 0.0035;
+    const tinyLoops = loops.filter((x) => x.areaAbs <= tinyThreshold);
+    const hull = convexHullFromPoints(sourcePts);
+    const normalized = tinyLoops.map((x) => ({
+      openPts: x.openPts,
+      closedPts: x.closedPts,
+      areaAbs: x.areaAbs,
+      bbox: x.bbox,
+      sample: x.sample,
+      parent: -1,
+      depth: -1
+    }));
+    const hullRec = makeLoopRecord(hull, {
+      minX: sourceMinX, minY: sourceMinY, maxX: sourceMaxX, maxY: sourceMaxY
+    });
+    if (hullRec) normalized.push(hullRec);
+
+    if (normalized.length >= 1) {
+      loops.length = 0;
+      loops.push(...normalized);
+    }
+  }
+
+  if (allowHullFallback && sourcePts.length >= 3) {
+    const bboxArea = sourceBBoxArea;
     const maxLoopArea = Math.max(...loops.map((x) => x.areaAbs));
     const hasLikelyOuter = loops.some((x) => x.areaAbs > bboxArea * 0.05);
     if (!hasLikelyOuter || !(maxLoopArea > bboxArea * 0.01)) {
       const hull = convexHullFromPoints(sourcePts);
       if (hull.length >= 3) {
-        const closedHull = buildClosedPointList(hull);
-        if (closedHull && closedHull.length >= 4) {
-          const hullOpen = closedHull.slice(0, -1);
-          loops.push({
-            openPts: hullOpen,
-            closedPts: closedHull,
-            areaAbs: Math.abs(polygonAreaSigned(hullOpen)),
-            bbox: { minX, minY, maxX, maxY },
-            sample: pickSampleInside(hullOpen, closedHull),
-            parent: -1,
-            depth: -1
-          });
+        const rec = makeLoopRecord(hull, {
+          minX: sourceMinX, minY: sourceMinY, maxX: sourceMaxX, maxY: sourceMaxY
+        });
+        if (rec) loops.push(rec);
+      }
+    }
+  }
+
+  function tryBuildDensePerforatedPanelShape() {
+    if (!hasSourceBBox) return null;
+    if (loops.length < 220) return null;
+
+    let outerIdx = -1;
+    let outerArea = 0;
+    for (let i = 0; i < loops.length; i += 1) {
+      if (loops[i].areaAbs > outerArea) {
+        outerArea = loops[i].areaAbs;
+        outerIdx = i;
+      }
+    }
+    if (outerIdx < 0) return null;
+    if (outerArea < sourceBBoxArea * 0.30) return null;
+
+    const outer = loops[outerIdx];
+    const candidates = [];
+    for (let i = 0; i < loops.length; i += 1) {
+      if (i === outerIdx) continue;
+      const loop = loops[i];
+      if (!(loop.areaAbs > 1e-8)) continue;
+      if (loop.areaAbs > sourceBBoxArea * 0.02) continue;
+      if (!bboxContainsPoint(outer.bbox, loop.sample, 1e-4)) continue;
+      if (!pointInPolygonStrict(loop.sample, outer.closedPts)) continue;
+      candidates.push(loop);
+    }
+    if (candidates.length < 120) return null;
+
+    const minDims = candidates
+      .map((l) => Math.min(
+        Math.max(EPS, Number(l.bbox.maxX) - Number(l.bbox.minX)),
+        Math.max(EPS, Number(l.bbox.maxY) - Number(l.bbox.minY))
+      ))
+      .filter((d) => Number.isFinite(d) && d > EPS)
+      .sort((a, b) => a - b);
+    if (!minDims.length) return null;
+    const medianDim = minDims[Math.floor(minDims.length * 0.5)];
+    // Keep center dedupe very strict: only collapse truly duplicated loops
+    // (same hole represented twice), not neighboring holes in dense grids.
+    const quant = Math.max(1e-4, Math.min(0.25, medianDim * 0.03));
+
+    const bestByCell = new Map();
+    for (const loop of candidates) {
+      const cx = (Number(loop.bbox.minX) + Number(loop.bbox.maxX)) * 0.5;
+      const cy = (Number(loop.bbox.minY) + Number(loop.bbox.maxY)) * 0.5;
+      const key = `${Math.round(cx / quant)}_${Math.round(cy / quant)}`;
+      const prev = bestByCell.get(key);
+      if (!prev || loop.areaAbs > prev.areaAbs) bestByCell.set(key, loop);
+    }
+
+    const dedupHoles = [...bestByCell.values()];
+    if (dedupHoles.length < 90) return null;
+
+    const shape = new THREE.Shape(orientLoop(outer.openPts, false));
+    for (const hole of dedupHoles) {
+      const holePts = orientLoop(hole.openPts, true);
+      if (holePts.length < 3) continue;
+      shape.holes.push(new THREE.Path(holePts));
+    }
+    return [shape];
+  }
+
+  const densePanelShapes = tryBuildDensePerforatedPanelShape();
+  if (densePanelShapes && densePanelShapes.length > 0) return densePanelShapes;
+
+  function buildDepthAndChildrenFromParents() {
+    for (const loop of loops) loop.depth = -1;
+
+    function resolveDepth(idx) {
+      if (loops[idx].depth >= 0) return loops[idx].depth;
+      const parent = loops[idx].parent;
+      loops[idx].depth = parent < 0 ? 0 : resolveDepth(parent) + 1;
+      return loops[idx].depth;
+    }
+    for (let i = 0; i < loops.length; i += 1) resolveDepth(i);
+
+    const childrenByParent = new Map();
+    for (let i = 0; i < loops.length; i += 1) {
+      const parent = loops[i].parent;
+      if (parent < 0) continue;
+      const list = childrenByParent.get(parent) || [];
+      list.push(i);
+      childrenByParent.set(parent, list);
+    }
+    return childrenByParent;
+  }
+
+  function computeLoopHierarchy() {
+    for (const loop of loops) {
+      loop.parent = -1;
+      loop.depth = -1;
+    }
+
+    for (let i = 0; i < loops.length; i += 1) {
+      const loop = loops[i];
+      let bestParent = -1;
+      for (let j = 0; j < loops.length; j += 1) {
+        if (i === j) continue;
+        const candidate = loops[j];
+        if (!(candidate.areaAbs > loop.areaAbs + 1e-8)) continue;
+        if (!bboxContainsPoint(candidate.bbox, loop.sample)) continue;
+        if (!pointInPolygonStrict(loop.sample, candidate.closedPts)) continue;
+        if (bestParent === -1 || candidate.areaAbs < loops[bestParent].areaAbs) bestParent = j;
+      }
+      loop.parent = bestParent;
+    }
+
+    return buildDepthAndChildrenFromParents();
+  }
+
+  let childrenByParent = computeLoopHierarchy();
+
+  if (hasSourceBBox && sourcePts.length >= 3) {
+    const rootIdx = [];
+    for (let i = 0; i < loops.length; i += 1) {
+      if (loops[i].parent < 0) rootIdx.push(i);
+    }
+
+    if (rootIdx.length >= 3) {
+      const sourceW = Math.max(EPS, sourceMaxX - sourceMinX);
+      const sourceH = Math.max(EPS, sourceMaxY - sourceMinY);
+      const borderTol = Math.max(4.0, Math.min(sourceW, sourceH) * 0.06);
+      let borderTouchCount = 0;
+      for (const idx of rootIdx) {
+        const b = loops[idx].bbox;
+        const minInset = Math.min(
+          b.minX - sourceMinX,
+          sourceMaxX - b.maxX,
+          b.minY - sourceMinY,
+          sourceMaxY - b.maxY
+        );
+        if (minInset <= borderTol) borderTouchCount += 1;
+      }
+
+      const rootAreas = rootIdx
+        .map((idx) => loops[idx].areaAbs)
+        .sort((a, b) => b - a);
+      const tinyThreshold = sourceBBoxArea * 0.002;
+      const tinyLoops = loops.filter((x) => x.areaAbs <= tinyThreshold);
+
+      const looksFragmentedSheet =
+        borderTouchCount >= 3 &&
+        tinyLoops.length >= 6 &&
+        rootAreas.length >= 3 &&
+        rootAreas[0] < sourceBBoxArea * 0.45;
+
+      if (looksFragmentedSheet) {
+        const hull = convexHullFromPoints(sourcePts);
+        const normalized = tinyLoops.map((t) => ({
+          openPts: t.openPts,
+          closedPts: t.closedPts,
+          areaAbs: t.areaAbs,
+          bbox: t.bbox,
+          sample: t.sample,
+          parent: -1,
+          depth: -1
+        }));
+        const hullRec = makeLoopRecord(hull, {
+          minX: sourceMinX, minY: sourceMinY, maxX: sourceMaxX, maxY: sourceMaxY
+        });
+        if (hullRec) normalized.push(hullRec);
+
+        if (normalized.length >= 2) {
+          loops.length = 0;
+          loops.push(...normalized);
+          childrenByParent = computeLoopHierarchy();
         }
       }
     }
   }
 
-  for (let i = 0; i < loops.length; i += 1) {
-    const loop = loops[i];
-    let bestParent = -1;
-    for (let j = 0; j < loops.length; j += 1) {
-      if (i === j) continue;
-      const candidate = loops[j];
-      if (!(candidate.areaAbs > loop.areaAbs + 1e-8)) continue;
-      if (!bboxContainsPoint(candidate.bbox, loop.sample)) continue;
-      if (!pointInPolygonStrict(loop.sample, candidate.closedPts)) continue;
-      if (bestParent === -1 || candidate.areaAbs < loops[bestParent].areaAbs) bestParent = j;
-    }
-    loop.parent = bestParent;
-  }
-
-  function resolveDepth(idx) {
-    if (loops[idx].depth >= 0) return loops[idx].depth;
-    const parent = loops[idx].parent;
-    loops[idx].depth = parent < 0 ? 0 : resolveDepth(parent) + 1;
-    return loops[idx].depth;
-  }
-  for (let i = 0; i < loops.length; i += 1) resolveDepth(i);
-
-  const childrenByParent = new Map();
-  for (let i = 0; i < loops.length; i += 1) {
-    const parent = loops[i].parent;
-    if (parent < 0) continue;
-    const list = childrenByParent.get(parent) || [];
-    list.push(i);
-    childrenByParent.set(parent, list);
-  }
-
+  const pseudoHoleSkipSet = new Set();
   const descendantCountCache = new Map();
   function countDescendants(idx) {
     if (descendantCountCache.has(idx)) return descendantCountCache.get(idx);
@@ -1673,11 +2119,23 @@ function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
     return total;
   }
 
-  function shouldSkipAsPseudoHole(parentLoop, childLoop, childIdx) {
+  function shouldSkipAsPseudoHole(parentLoop, parentIdx, childLoop, childIdx) {
     const parentArea = Math.max(EPS, Number(parentLoop?.areaAbs || 0));
     const childArea = Math.max(0, Number(childLoop?.areaAbs || 0));
     const areaRatio = childArea / parentArea;
     if (!(areaRatio > 0.70)) return false;
+
+    const siblings = (childrenByParent.get(parentIdx) || []).filter((idx) => idx !== childIdx);
+    let tinySiblingCount = 0;
+    for (const idx of siblings) {
+      const sibArea = Math.max(0, Number(loops[idx]?.areaAbs || 0));
+      if ((sibArea / parentArea) < 0.02) tinySiblingCount += 1;
+    }
+
+    // Common CNC export pattern for sheet parts:
+    // a large inner offset contour plus many tiny drilling loops.
+    // The large inner contour is a duplicated border, not a true cutout.
+    if (areaRatio > 0.68 && tinySiblingCount >= 6) return true;
 
     const parentW = Math.max(EPS, Number(parentLoop?.bbox?.maxX) - Number(parentLoop?.bbox?.minX));
     const parentH = Math.max(EPS, Number(parentLoop?.bbox?.maxY) - Number(parentLoop?.bbox?.minY));
@@ -1693,28 +2151,213 @@ function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
 
     // Large inset loops with many descendants are usually duplicated borders,
     // not real cutouts (common in some BricsCAD exports).
-    return countDescendants(childIdx) >= 6;
+    if (countDescendants(childIdx) >= 6) return true;
+
+    if (tinySiblingCount >= 8) return true;
+    if (areaRatio > 0.82 && tinySiblingCount >= 4) return true;
+    return false;
+  }
+
+  function normalizePseudoHoleContainers() {
+    let changed = false;
+    for (let parentIdx = 0; parentIdx < loops.length; parentIdx += 1) {
+      const parentLoop = loops[parentIdx];
+      if (parentLoop.depth % 2 !== 0) continue;
+
+      const children = [...(childrenByParent.get(parentIdx) || [])];
+      for (const childIdx of children) {
+        if (pseudoHoleSkipSet.has(childIdx)) continue;
+        const childLoop = loops[childIdx];
+        if (childLoop.depth % 2 !== 1) continue;
+        if (!shouldSkipAsPseudoHole(parentLoop, parentIdx, childLoop, childIdx)) continue;
+
+        pseudoHoleSkipSet.add(childIdx);
+        const grandChildren = childrenByParent.get(childIdx) || [];
+        if (!grandChildren.length) continue;
+
+        // Flatten duplicated container contours: keep descendants and reattach
+        // them to the real parent so true slots/holes preserve odd depth.
+        for (const grandIdx of grandChildren) loops[grandIdx].parent = parentIdx;
+        loops[childIdx].parent = -1;
+        changed = true;
+      }
+    }
+    if (changed) {
+      descendantCountCache.clear();
+      childrenByParent = buildDepthAndChildrenFromParents();
+    }
+    return changed;
+  }
+
+  for (let guard = 0; guard < 8; guard += 1) {
+    if (!normalizePseudoHoleContainers()) break;
+  }
+
+  function shouldSkipNestedIsland(idx) {
+    const loop = loops[idx];
+    if (!loop || loop.depth < 2 || (loop.depth % 2) !== 0) return false;
+    if (!hasSourceBBox || !(sourceBBoxArea > EPS)) return false;
+
+    const parentIdx = loop.parent;
+    if (!(parentIdx >= 0)) return false;
+    const parent = loops[parentIdx];
+    if (!parent || (parent.depth % 2) !== 1) return false;
+
+    const loopArea = Math.max(0, Number(loop.areaAbs || 0));
+    const parentArea = Math.max(EPS, Number(parent.areaAbs || 0));
+    const areaRatio = loopArea / parentArea;
+    if (!(areaRatio > 0.20 && areaRatio < 0.98)) return false;
+
+    const tinyLoop = loopArea <= sourceBBoxArea * 0.01;
+    const tinyParent = parentArea <= sourceBBoxArea * 0.02;
+    if (!(tinyLoop && tinyParent)) return false;
+
+    const parentCx = (Number(parent.bbox.maxX) + Number(parent.bbox.minX)) * 0.5;
+    const parentCy = (Number(parent.bbox.maxY) + Number(parent.bbox.minY)) * 0.5;
+    const childCx = (Number(loop.bbox.maxX) + Number(loop.bbox.minX)) * 0.5;
+    const childCy = (Number(loop.bbox.maxY) + Number(loop.bbox.minY)) * 0.5;
+    const centerDist = Math.hypot(childCx - parentCx, childCy - parentCy);
+    const parentW = Math.max(EPS, Number(parent.bbox.maxX) - Number(parent.bbox.minX));
+    const parentH = Math.max(EPS, Number(parent.bbox.maxY) - Number(parent.bbox.minY));
+    const centerTol = Math.max(0.6, Math.min(parentW, parentH) * 0.22);
+    if (centerDist > centerTol) return false;
+
+    return true;
   }
 
   const shapes = [];
+  const shapeMetas = [];
   for (let i = 0; i < loops.length; i += 1) {
     const loop = loops[i];
+    if (pseudoHoleSkipSet.has(i)) continue;
     if (loop.depth % 2 !== 0) continue;
+    if (shouldSkipNestedIsland(i)) continue;
     const outerPts = orientLoop(loop.openPts, false);
     if (outerPts.length < 3) continue;
     const shape = new THREE.Shape(outerPts);
 
     const children = childrenByParent.get(i) || [];
     for (const childIdx of children) {
+      if (pseudoHoleSkipSet.has(childIdx)) continue;
       const child = loops[childIdx];
       if (child.depth % 2 !== 1) continue;
-      if (shouldSkipAsPseudoHole(loop, child, childIdx)) continue;
       const holePts = orientLoop(child.openPts, true);
       if (holePts.length < 3) continue;
       shape.holes.push(new THREE.Path(holePts));
     }
     shapes.push(shape);
+    shapeMetas.push({
+      loopIdx: i,
+      area: loop.areaAbs,
+      holeCount: shape.holes.length,
+      sample: loop.sample,
+      bbox: loop.bbox
+    });
   }
+
+  function bboxArea2D(bbox) {
+    if (!bbox) return 0;
+    const w = Math.max(0, Number(bbox.maxX) - Number(bbox.minX));
+    const h = Math.max(0, Number(bbox.maxY) - Number(bbox.minY));
+    return w * h;
+  }
+
+  function bboxIntersectionArea2D(a, b) {
+    if (!a || !b) return 0;
+    const minX = Math.max(Number(a.minX), Number(b.minX));
+    const minY = Math.max(Number(a.minY), Number(b.minY));
+    const maxX = Math.min(Number(a.maxX), Number(b.maxX));
+    const maxY = Math.min(Number(a.maxY), Number(b.maxY));
+    if (!(maxX > minX) || !(maxY > minY)) return 0;
+    return (maxX - minX) * (maxY - minY);
+  }
+
+  if (shapes.length > 1 && hasSourceBBox) {
+    let dominantMetaIdx = -1;
+    let dominantArea = 0;
+    for (let i = 0; i < shapeMetas.length; i += 1) {
+      if (shapeMetas[i].area > dominantArea) {
+        dominantArea = shapeMetas[i].area;
+        dominantMetaIdx = i;
+      }
+    }
+
+    if (dominantMetaIdx >= 0) {
+      const dominant = shapeMetas[dominantMetaIdx];
+      const dominantLoop = loops[dominant.loopIdx];
+      const densePerforatedPattern =
+        dominant.holeCount >= 80 &&
+        dominant.area >= sourceBBoxArea * 0.35;
+
+      if (densePerforatedPattern && dominantLoop?.closedPts) {
+        const dominantDensity = dominant.holeCount / Math.max(EPS, dominant.area);
+        const dominantBBox = dominant.bbox || dominantLoop.bbox;
+        const filteredShapes = [];
+        const filteredMetas = [];
+        for (let i = 0; i < shapes.length; i += 1) {
+          if (i === dominantMetaIdx) {
+            filteredShapes.push(shapes[i]);
+            filteredMetas.push(shapeMetas[i]);
+            continue;
+          }
+
+          const meta = shapeMetas[i];
+          const insideDominant = pointInPolygonStrict(meta.sample, dominantLoop.closedPts);
+          const areaRatio = meta.area / Math.max(EPS, dominant.area);
+          const holeDensity = meta.holeCount / Math.max(EPS, meta.area);
+          const densityRatio = holeDensity / Math.max(EPS, dominantDensity);
+          const selfBBoxArea = bboxArea2D(meta.bbox);
+          const overlapRatio = selfBBoxArea > EPS
+            ? (bboxIntersectionArea2D(meta.bbox, dominantBBox) / selfBBoxArea)
+            : 0;
+          const looksArtifactOverlay =
+            insideDominant &&
+            areaRatio >= 0.04 &&
+            areaRatio <= 0.98 &&
+            (
+              meta.holeCount <= 2 ||
+              densityRatio < 0.35
+            ) &&
+            (
+              areaRatio >= 0.16 ||
+              overlapRatio >= 0.45 ||
+              meta.holeCount <= 1
+            );
+
+          if (!looksArtifactOverlay) {
+            filteredShapes.push(shapes[i]);
+            filteredMetas.push(meta);
+          }
+        }
+
+        // For heavily perforated plates, any additional interior solid islands
+        // are usually duplicated export artifacts. Keep only the dominant shape.
+        const secondary = filteredMetas.filter((meta) => meta.loopIdx !== dominant.loopIdx);
+        const allSecondaryInsideDominant = secondary.every((meta) =>
+          pointInPolygonStrict(meta.sample, dominantLoop.closedPts)
+        );
+        const hasLargeLowDensityOverlay = secondary.some((meta) => {
+          const areaRatio = meta.area / Math.max(EPS, dominant.area);
+          const holeDensity = meta.holeCount / Math.max(EPS, meta.area);
+          const densityRatio = holeDensity / Math.max(EPS, dominantDensity);
+          return areaRatio >= 0.10 && densityRatio < 0.45;
+        });
+        if (
+          allSecondaryInsideDominant &&
+          hasLargeLowDensityOverlay &&
+          dominant.holeCount >= 160
+        ) {
+          return [shapes[dominantMetaIdx]];
+        }
+
+        if (filteredShapes.length === 1 && dominant.holeCount >= 80) {
+          return filteredShapes;
+        }
+        return filteredShapes.length > 0 ? filteredShapes : [shapes[dominantMetaIdx]];
+      }
+    }
+  }
+
   return shapes;
 }
 
@@ -1728,10 +2371,23 @@ function importWithCncContours(dxfText, filename, thickness, material, localGrou
       return false;
     }
   }
+  let rawLineArcMode = false;
+  if (shouldReparseInRawLineArcMode(parsed)) {
+    try {
+      const rawParsed = parseDxfAsciiCnc(dxfText, { preferSimple: true });
+      if (rawParsed?.contours?.length > 0) {
+        parsed = rawParsed;
+        rawLineArcMode = true;
+      }
+    } catch (error) {
+      console.warn("Falha no reparse raw LINE/ARC para:", filename, error);
+    }
+  }
   if (!parsed || !Array.isArray(parsed.contours) || parsed.contours.length < 1) return false;
   if (!(Number(parsed.width) > EPS && Number(parsed.height) > EPS)) return false;
 
   const closedLoops = [];
+  const declaredClosedLoops = [];
   const allPoints = [];
   const segments = [];
   const fallbackOpenShapes = [];
@@ -1746,7 +2402,11 @@ function importWithCncContours(dxfText, filename, thickness, material, localGrou
 
     if (contour.closed) {
       const shapeInfo = buildShapeInfoFromPoints(pts);
-      if (shapeInfo) closedLoops.push(shapeInfo.outline.slice(0, -1));
+      if (shapeInfo) {
+        const loopOpen = shapeInfo.outline.slice(0, -1);
+        closedLoops.push(loopOpen);
+        declaredClosedLoops.push(loopOpen);
+      }
     } else {
       openContours.push(pts);
       appendSegmentsFromPointList(pts, segments);
@@ -1767,17 +2427,50 @@ function importWithCncContours(dxfText, filename, thickness, material, localGrou
     const stitchTol = Math.max(0.05, Math.min(0.6, minSide * 0.005));
     segmentLoops = stitchClosedLoopsFromOpenContours(openContours, stitchTol);
   }
-  for (const loopPts of segmentLoops) {
-    const shapeInfo = buildShapeInfoFromPoints(loopPts);
-    if (shapeInfo) closedLoops.push(shapeInfo.outline.slice(0, -1));
+
+  const sourceArea = Math.max(EPS, Number(parsed.width) * Number(parsed.height));
+  let forceHullFromTinyClosed = false;
+  if (!rawLineArcMode) {
+    forceHullFromTinyClosed = shouldForceHullFromTinyClosedLoops(
+      declaredClosedLoops,
+      sourceArea,
+      openContours.length,
+      segmentLoops.length
+    );
+  }
+  let stitchedOuterLoop = null;
+  if (forceHullFromTinyClosed) {
+    const minSide = Math.max(1.0, Math.min(Number(parsed.width), Number(parsed.height)));
+    stitchedOuterLoop = findDominantOuterLoopFromOpenContours(
+      openContours,
+      sourceArea,
+      minSide
+    );
+    if (stitchedOuterLoop && stitchedOuterLoop.length >= 3) {
+      forceHullFromTinyClosed = false;
+    }
+  }
+
+  if (stitchedOuterLoop && stitchedOuterLoop.length >= 3) {
+    const tinyLoops = collectTinyClosedLoops(declaredClosedLoops, sourceArea);
+    closedLoops.length = 0;
+    closedLoops.push(...tinyLoops, stitchedOuterLoop);
+  } else {
+    for (const loopPts of segmentLoops) {
+      const shapeInfo = buildShapeInfoFromPoints(loopPts);
+      if (shapeInfo) closedLoops.push(shapeInfo.outline.slice(0, -1));
+    }
   }
 
   const closedShapes = buildShapesFromClosedLoops(
     closedLoops,
     allPoints,
-    { allowHullFallback: true }
+    {
+      allowHullFallback: true,
+      forceHullFromTinyClosed
+    }
   );
-  assignSelectionOutlineData(localGroup, closedLoops, allPoints);
+  assignSelectionOutlineDataFromShapes(localGroup, closedShapes, closedLoops, allPoints);
   for (const shape of closedShapes) {
     const mesh = makeExtrudedMeshFromShape(shape, thickness, material);
     localGroup.add(mesh);
@@ -1800,10 +2493,16 @@ function importWithCncContours(dxfText, filename, thickness, material, localGrou
 }
 
 function makeExtrudedMeshFromShape(shape, thickness, material) {
+  const holeCount = Array.isArray(shape?.holes) ? shape.holes.length : 0;
+  let curveSegments = 16;
+  if (holeCount > 1200) curveSegments = 5;
+  else if (holeCount > 700) curveSegments = 6;
+  else if (holeCount > 350) curveSegments = 8;
+
   const geo = new THREE.ExtrudeGeometry(shape, {
     depth: thickness,
     bevelEnabled: false,
-    curveSegments: 16,
+    curveSegments,
     steps: 1
   });
 
@@ -1816,6 +2515,32 @@ function makeExtrudedMeshFromShape(shape, thickness, material) {
 function reportImportIssue(onIssue, message) {
   if (typeof onIssue === "function") onIssue(message);
   else alert(message);
+}
+
+function shouldReparseInRawLineArcMode(parsed) {
+  if (!parsed || !Array.isArray(parsed.contours) || parsed.contours.length < 3) return false;
+  const sourceArea = Math.max(EPS, Number(parsed.width) * Number(parsed.height));
+  if (!(sourceArea > EPS)) return false;
+
+  let openCount = 0;
+  let maxClosedArea = 0;
+  for (const contour of parsed.contours) {
+    const pts = (contour?.points || [])
+      .map((pt) => new THREE.Vector2(Number(pt?.[0]), Number(pt?.[1])))
+      .filter((pt) => Number.isFinite(pt.x) && Number.isFinite(pt.y));
+    if (pts.length < 2) continue;
+    if (!contour?.closed) {
+      openCount += 1;
+      continue;
+    }
+    if (pts.length < 3) continue;
+    const area = Math.abs(polygonAreaSigned(pts));
+    if (area > maxClosedArea) maxClosedArea = area;
+  }
+
+  // Typical LINE/ARC CNC plate export:
+  // many open segments forming border + only tiny closed loops (holes).
+  return openCount >= 2 && maxClosedArea < sourceArea * 0.02;
 }
 
 function finalizeImportedGroup(localGroup, autoCenter) {
@@ -1877,6 +2602,7 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
   }
 
   const closedLoops = [];
+  const declaredClosedLoops = [];
   const allPoints = [];
   const segments = [];
   const openContoursForStitch = [];
@@ -1895,6 +2621,7 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
       const loopPts = circleToLoopPoints(circleInfo.center, circleInfo.radius);
       if (loopPts.length >= 3) {
         closedLoops.push(loopPts);
+        declaredClosedLoops.push(loopPts);
         allPoints.push(...loopPts);
       }
       continue;
@@ -1929,7 +2656,9 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
       continue;
     }
 
-    closedLoops.push(shapeInfo.outline.slice(0, -1));
+    const loopOpen = shapeInfo.outline.slice(0, -1);
+    closedLoops.push(loopOpen);
+    declaredClosedLoops.push(loopOpen);
   }
 
   for (const ent of lineEntities) {
@@ -1956,7 +2685,11 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
 
     if (splineInfo.closed) {
       const shapeInfo = buildShapeInfoFromPoints(splineInfo.pts);
-      if (shapeInfo) closedLoops.push(shapeInfo.outline.slice(0, -1));
+      if (shapeInfo) {
+        const loopOpen = shapeInfo.outline.slice(0, -1);
+        closedLoops.push(loopOpen);
+        declaredClosedLoops.push(loopOpen);
+      }
       continue;
     }
 
@@ -1977,17 +2710,49 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
     const stitchTol = Math.max(0.05, Math.min(0.6, Math.sqrt(Math.max(1.0, allPoints.length)) * 0.03));
     segmentLoops = stitchClosedLoopsFromOpenContours(openContoursForStitch, stitchTol);
   }
-  for (const loopPts of segmentLoops) {
-    const shapeInfo = buildShapeInfoFromPoints(loopPts);
-    if (shapeInfo) closedLoops.push(shapeInfo.outline.slice(0, -1));
+
+  const sourceBounds = computePointCloudBounds(allPoints);
+  const sourceArea = sourceBounds ? sourceBounds.area : 0;
+  const openEntityCount = openContoursForStitch.length + lineEntities.length + arcEntities.length;
+  let forceHullFromTinyClosed = shouldForceHullFromTinyClosedLoops(
+    declaredClosedLoops,
+    sourceArea,
+    openEntityCount,
+    segmentLoops.length
+  );
+  let stitchedOuterLoop = null;
+  if (forceHullFromTinyClosed) {
+    const minSide = sourceBounds ? Math.max(1.0, Math.min(sourceBounds.width, sourceBounds.height)) : 1.0;
+    stitchedOuterLoop = findDominantOuterLoopFromOpenContours(
+      openContoursForStitch,
+      sourceArea,
+      minSide
+    );
+    if (stitchedOuterLoop && stitchedOuterLoop.length >= 3) {
+      forceHullFromTinyClosed = false;
+    }
+  }
+
+  if (stitchedOuterLoop && stitchedOuterLoop.length >= 3) {
+    const tinyLoops = collectTinyClosedLoops(declaredClosedLoops, sourceArea);
+    closedLoops.length = 0;
+    closedLoops.push(...tinyLoops, stitchedOuterLoop);
+  } else {
+    for (const loopPts of segmentLoops) {
+      const shapeInfo = buildShapeInfoFromPoints(loopPts);
+      if (shapeInfo) closedLoops.push(shapeInfo.outline.slice(0, -1));
+    }
   }
 
   const closedShapes = buildShapesFromClosedLoops(
     closedLoops,
     allPoints,
-    { allowHullFallback: true }
+    {
+      allowHullFallback: true,
+      forceHullFromTinyClosed
+    }
   );
-  assignSelectionOutlineData(localGroup, closedLoops, allPoints);
+  assignSelectionOutlineDataFromShapes(localGroup, closedShapes, closedLoops, allPoints);
 
   for (const shape of closedShapes) {
     const mesh = makeExtrudedMeshFromShape(shape, thickness, material);
