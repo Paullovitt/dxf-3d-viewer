@@ -231,3 +231,46 @@ Se houver erro de autenticacao no push, configurar credencial/token do GitHub no
   - usar `Enquadrar (Fit)` e verificar `Centro automatico`
 - DXF com canto/furo estranho:
   - validar se veio em `LINE/ARC` aberto e revisar logs de stitch/hierarquia
+
+## 16. Casos resolvidos
+
+### Caso A - Painel perfurado preenchendo lado interno (ex.: `210921`)
+
+- Sintoma:
+  - parte interna do painel aparecia \"pintada\" em um lado, enquanto no FreeCAD os furos estavam corretos
+- Causa raiz:
+  - varios furos vieram como loop composto/auto-intersectante (duas voltas no mesmo caminho), gerando triangulacao invalida
+- Correcao:
+  - normalizacao de loop composto em `buildShapesFromClosedLoops(...)` via `splitCompoundLoopCandidates(...)`
+  - deduplicacao por centro de furo para manter uma representacao valida por cavidade
+- Resultado:
+  - furos passaram a ser reconhecidos corretamente dos dois lados, sem preenchimento falso
+- Commit:
+  - `d7ceece`
+
+### Caso B - Barra curva gerando chapa falsa preenchida (peca `212376`)
+
+- Sintoma:
+  - geometria correta no FreeCAD, mas no viewer aparecia uma shape grande preenchida por cima da peca curva
+- Causa raiz:
+  - `hull fallback` adicionava um contorno convexo extra, mesmo ja existindo contorno pai valido com furos internos
+- Correcao:
+  - guarda de `hull fallback` com deteccao de \"strong container contour\" antes de criar hull
+- Resultado:
+  - peca passou a sair com 1 shape valida + furos, sem overlay preenchido
+- Commit:
+  - `291da5c`
+
+### Caso C - Pecas com `LINE/ARC` e furos pequenos (ex.: `212414`, `212541`, `212232`, `212336`)
+
+- Sintoma:
+  - contorno/furos inconsistentes dependendo da regiao da peca
+- Causa raiz:
+  - export CAD com combinacao de contornos abertos + loops internos duplicados
+- Correcao:
+  - reparse em modo bruto `LINE/ARC` quando detectado padrao de chapa
+  - normalizacao de pseudo-containers e ajuste de hierarquia contorno/furo
+- Resultado:
+  - importacao consistente dessas pecas, com furos e bordas preservados
+- Commit:
+  - `d7ceece`
