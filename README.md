@@ -144,6 +144,21 @@ Resultado:
 Mesmo apos hierarquia, se houver shape interno com baixa densidade de furos,
 contido no shape dominante perfurado, ele e descartado como artefato.
 
+### 7.6 Guarda para pecas longas/curvas (evitar hull falso)
+
+Problema observado em pecas tipo barra curva (ex.: `212376`):
+- o `hull fallback` podia adicionar um contorno convexo extra
+- isso gerava uma shape falsa preenchida por cima da peca real
+
+Correcao aplicada:
+- antes de adicionar hull, o algoritmo detecta se ja existe contorno pai forte
+  contendo os demais loops internos (furos)
+- se esse contorno forte existe, o hull nao e criado
+
+Resultado:
+- peca curva mantem apenas a shape valida (borda + furos)
+- evita \"triangulo/chapa\" preenchida indevida em geometrias esbeltas
+
 ## 8. Selecao, edicao e atalhos
 
 - Clique: seleciona peca.

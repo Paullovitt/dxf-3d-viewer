@@ -1926,7 +1926,42 @@ function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
     const bboxArea = sourceBBoxArea;
     const maxLoopArea = Math.max(...loops.map((x) => x.areaAbs));
     const hasLikelyOuter = loops.some((x) => x.areaAbs > bboxArea * 0.05);
-    if (!hasLikelyOuter || !(maxLoopArea > bboxArea * 0.01)) {
+    let hasStrongContainerContour = false;
+    if (loops.length >= 2) {
+      let outerIdx = 0;
+      let secondArea = 0;
+      for (let i = 1; i < loops.length; i += 1) {
+        if (loops[i].areaAbs > loops[outerIdx].areaAbs) outerIdx = i;
+      }
+      for (let i = 0; i < loops.length; i += 1) {
+        if (i === outerIdx) continue;
+        secondArea = Math.max(secondArea, loops[i].areaAbs);
+      }
+
+      let insideCount = 0;
+      const outer = loops[outerIdx];
+      for (let i = 0; i < loops.length; i += 1) {
+        if (i === outerIdx) continue;
+        const loop = loops[i];
+        if (!bboxContainsPoint(outer.bbox, loop.sample, 1e-4)) continue;
+        if (!pointInPolygonStrict(loop.sample, outer.closedPts)) continue;
+        insideCount += 1;
+      }
+
+      const requiredInside = Math.max(1, Math.min(3, loops.length - 1));
+      hasStrongContainerContour =
+        insideCount >= requiredInside &&
+        outer.areaAbs >= Math.max(secondArea * 6.0, bboxArea * 0.002);
+    }
+
+    const shouldAddHull =
+      !hasLikelyOuter &&
+      (
+        !(maxLoopArea > bboxArea * 0.01) ||
+        !hasStrongContainerContour
+      );
+
+    if (shouldAddHull) {
       const hull = convexHullFromPoints(sourcePts);
       if (hull.length >= 3) {
         const rec = makeLoopRecord(hull, {
