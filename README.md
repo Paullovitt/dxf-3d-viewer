@@ -248,6 +248,9 @@ Se houver erro de autenticacao no push, configurar credencial/token do GitHub no
   - usar `Enquadrar (Fit)` e verificar `Centro automatico`
 - DXF com canto/furo estranho:
   - validar se veio em `LINE/ARC` aberto e revisar logs de stitch/hierarquia
+- Erro `Falha ao converter ... no servidor (501)`:
+  - isso ocorre quando esta rodando apenas servidor estatico sem API
+  - o app agora troca automaticamente para `Atual (Browser DXF)` para nao bloquear importacao
 
 ## 16. Casos resolvidos
 
@@ -305,6 +308,11 @@ No topo da tela existe `Modo importacao` com duas opcoes:
 
 Objetivo:
 - comparar qualidade/geometria e desempenho entre os dois fluxos no mesmo viewer.
+
+Comportamento de seguranca:
+- se o endpoint de servidor nao existir (ex.: servidor estatico `python -m http.server`),
+  o frontend detecta status como `404/405/501` ou resposta HTML e volta automaticamente
+  para `Atual (Browser DXF)`.
 
 ## 18. Backend recomendado (EZDXF + cache GLB)
 

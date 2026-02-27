@@ -2873,6 +2873,60 @@ async function addGlbToScene(arrayBuffer, filename, autoCenter = true, onIssue =
   return finalizeImportedGroup(localGroup, autoCenter);
 }
 
+let serverModeFallbackNotified = false;
+
+function switchImportModeToBrowser(onIssue = null, reason = "") {
+  if (importModeEl && importModeEl.value !== IMPORT_MODE_BROWSER) {
+    importModeEl.value = IMPORT_MODE_BROWSER;
+    localStorage.setItem(IMPORT_MODE_STORAGE_KEY, IMPORT_MODE_BROWSER);
+  }
+
+  if (reason && !serverModeFallbackNotified) {
+    reportImportIssue(onIssue, reason);
+    serverModeFallbackNotified = true;
+  }
+}
+
+function looksLikeHtmlBody(text) {
+  const t = String(text || "").trim().toLowerCase();
+  return t.startsWith("<!doctype html") || t.startsWith("<html") || t.includes("<head");
+}
+
+async function importSingleFileBrowserPipeline(
+  file,
+  thickness,
+  autoCenter = true,
+  onIssue = null,
+  workerPool = null
+) {
+  let text = "";
+  try {
+    text = await decodeDxfFile(file);
+  } catch (decodeError) {
+    console.error("Falha inesperada no decode:", file?.name, decodeError);
+    reportImportIssue(onIssue, `Falha inesperada ao ler ${file?.name || "arquivo"}. Veja o console (F12).`);
+    return false;
+  }
+
+  const pool = workerPool ?? getDxfWorkerPool();
+  const preParsed = pool ? await parseDxfWithWorkers(text, file?.name || "") : null;
+
+  try {
+    return addDxfToScene(
+      text,
+      file?.name || "arquivo.dxf",
+      thickness,
+      autoCenter,
+      onIssue,
+      preParsed
+    );
+  } catch (error) {
+    console.error("Falha inesperada ao importar:", file?.name, error);
+    reportImportIssue(onIssue, `Falha inesperada ao importar ${file?.name || "arquivo"}. Veja o console (F12).`);
+    return false;
+  }
+}
+
 async function addDxfToSceneViaServerGlb(file, thickness, autoCenter = true, onIssue = null) {
   const endpoint = "/api/convert-dxf-glb";
   const formData = new FormData();
@@ -2887,30 +2941,55 @@ async function addDxfToSceneViaServerGlb(file, thickness, autoCenter = true, onI
     });
   } catch (error) {
     console.error("Falha de rede no endpoint GLB:", error);
-    reportImportIssue(
+    switchImportModeToBrowser(
       onIssue,
-      `Modo servidor indisponivel para ${file?.name || "arquivo"} ` +
-      `(endpoint ${endpoint} sem resposta).`
+      `Modo servidor indisponivel (endpoint ${endpoint} sem resposta). ` +
+      "Voltando automaticamente para 'Atual (Browser DXF)'."
     );
-    return false;
+    return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
   }
 
   if (!response.ok) {
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
     let body = "";
     try {
       body = await response.text();
     } catch (_e) {
       body = "";
     }
-    const detail = body ? ` ${String(body).slice(0, 180)}` : "";
-    reportImportIssue(
-      onIssue,
-      `Falha ao converter ${file?.name || "arquivo"} no servidor (${response.status}).${detail}`
-    );
+
+    const unsupportedApi =
+      response.status === 404 ||
+      response.status === 405 ||
+      response.status === 501 ||
+      contentType.includes("text/html") ||
+      looksLikeHtmlBody(body);
+
+    if (unsupportedApi) {
+      switchImportModeToBrowser(
+        onIssue,
+        `Endpoint ${endpoint} nao esta ativo neste servidor (status ${response.status}). ` +
+        "Voltando automaticamente para 'Atual (Browser DXF)'."
+      );
+      return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
+    }
+
+    const trimmed = String(body || "").replace(/\s+/g, " ").trim();
+    const detail = trimmed && !looksLikeHtmlBody(trimmed) ? ` ${trimmed.slice(0, 180)}` : "";
+    reportImportIssue(onIssue, `Falha ao converter ${file?.name || "arquivo"} no servidor (${response.status}).${detail}`);
     return false;
   }
 
   const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("text/html")) {
+    switchImportModeToBrowser(
+      onIssue,
+      `Resposta HTML inesperada do endpoint ${endpoint}. ` +
+      "Voltando automaticamente para 'Atual (Browser DXF)'."
+    );
+    return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
+  }
+
   let glbBuffer = null;
   let serverWarnings = [];
 
@@ -3109,31 +3188,17 @@ fileInput.addEventListener("change", async (ev) => {
     const workerPool = getDxfWorkerPool();
 
     await Promise.all(files.map(async (f) => {
-      let text = "";
       try {
-        text = await decodeDxfFile(f);
-      } catch (decodeError) {
-        console.error("Falha inesperada no decode:", f?.name, decodeError);
-        importIssues.push(`Falha inesperada ao ler ${f?.name || "arquivo"}. Veja o console (F12).`);
-        return;
-      }
-
-      const preParsed = workerPool
-        ? await parseDxfWithWorkers(text, f?.name || "")
-        : null;
-
-      try {
-        const ok = addDxfToScene(
-          text,
-          f.name,
+        const ok = await importSingleFileBrowserPipeline(
+          f,
           thickness,
           autoCenter,
           (msg) => importIssues.push(msg),
-          preParsed
+          workerPool
         );
         if (ok) importedCount += 1;
       } catch (error) {
-        console.error("Falha inesperada ao importar:", f?.name, error);
+        console.error("Falha inesperada no modo browser DXF:", f?.name, error);
         importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
       } finally {
         // Atualiza o tempo enquanto o lote ainda esta processando.
