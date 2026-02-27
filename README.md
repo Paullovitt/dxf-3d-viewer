@@ -291,3 +291,46 @@ Se houver erro de autenticacao no push, configurar credencial/token do GitHub no
   - importacao consistente dessas pecas, com furos e bordas preservados
 - Commit:
   - `d7ceece`
+
+## 17. Modo A/B no frontend (Atual x Nova arquitetura)
+
+No topo da tela existe `Modo importacao` com duas opcoes:
+
+- `Atual (DXF no navegador)`:
+  - usa o pipeline JS atual (`dxf-worker.js` + fallback `dxf-parser`)
+- `Nova (EZDXF + GLB servidor)`:
+  - envia o arquivo DXF para o backend
+  - backend retorna GLB pronto
+  - frontend apenas carrega o GLB no viewer atual
+
+Objetivo:
+- comparar qualidade/geometria e desempenho entre os dois fluxos no mesmo viewer.
+
+## 18. Backend recomendado (EZDXF + cache GLB)
+
+Arquitetura recomendada:
+1. usar `ezdxf` para parse + healing do DXF
+2. gerar malha 3D e exportar `GLB` no servidor
+3. cachear por hash de entrada (`dxf + espessura + versao do pipeline`)
+4. opcional: gerar JSON com metadados 2D (contornos/furos) para selecao avancada
+
+### 18.1 Endpoint esperado pelo frontend
+
+`POST /api/convert-dxf-glb` (multipart/form-data):
+- `file`: arquivo `.dxf`
+- `thickness`: espessura em Z
+
+Respostas aceitas pelo frontend:
+
+1. Binario GLB direto:
+- `Content-Type: model/gltf-binary`
+- corpo = bytes do `.glb`
+
+2. JSON:
+- `glbBase64`: GLB em base64
+ou
+- `glbUrl`: URL para download do GLB
+
+Campos opcionais:
+- `warnings`: lista de avisos
+- `meta2d`: metadados 2D (contorno/furos), quando quiser suportar selecao avancada por dados CAD

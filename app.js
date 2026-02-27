@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // DXF parser (CDN)
 import DxfParser from "https://esm.sh/dxf-parser@1.1.2";
@@ -19,6 +20,7 @@ camera.position.set(180, 160, 180);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 container.appendChild(renderer.domElement);
+const gltfLoader = new GLTFLoader();
 
 // Lights
 scene.add(new THREE.AmbientLight(0xffffff, 0.65));
@@ -2829,6 +2831,140 @@ function addDxfToScene(dxfText, filename, thickness, autoCenter = true, onIssue 
   return finalizeImportedGroup(localGroup, autoCenter);
 }
 
+function decodeBase64ToArrayBuffer(base64Data) {
+  const raw = String(base64Data || "").replace(/^data:.*?;base64,/, "");
+  const bin = atob(raw);
+  const len = bin.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i += 1) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function parseGlbArrayBuffer(arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    gltfLoader.parse(
+      arrayBuffer,
+      "",
+      (gltf) => resolve(gltf),
+      (error) => reject(error || new Error("Falha ao parsear GLB"))
+    );
+  });
+}
+
+async function addGlbToScene(arrayBuffer, filename, autoCenter = true, onIssue = null) {
+  let gltf;
+  try {
+    gltf = await parseGlbArrayBuffer(arrayBuffer);
+  } catch (error) {
+    console.error("Falha ao parsear GLB:", filename, error);
+    reportImportIssue(onIssue, `Falha ao abrir GLB convertido de ${filename}.`);
+    return false;
+  }
+
+  const rootScene = gltf?.scene || (Array.isArray(gltf?.scenes) ? gltf.scenes[0] : null);
+  if (!rootScene) {
+    reportImportIssue(onIssue, `Resposta GLB invalida para ${filename}.`);
+    return false;
+  }
+
+  const localGroup = new THREE.Group();
+  localGroup.name = filename;
+  localGroup.add(rootScene);
+  return finalizeImportedGroup(localGroup, autoCenter);
+}
+
+async function addDxfToSceneViaServerGlb(file, thickness, autoCenter = true, onIssue = null) {
+  const endpoint = "/api/convert-dxf-glb";
+  const formData = new FormData();
+  formData.append("file", file, file?.name || "piece.dxf");
+  formData.append("thickness", String(thickness));
+
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      body: formData
+    });
+  } catch (error) {
+    console.error("Falha de rede no endpoint GLB:", error);
+    reportImportIssue(
+      onIssue,
+      `Modo servidor indisponivel para ${file?.name || "arquivo"} ` +
+      `(endpoint ${endpoint} sem resposta).`
+    );
+    return false;
+  }
+
+  if (!response.ok) {
+    let body = "";
+    try {
+      body = await response.text();
+    } catch (_e) {
+      body = "";
+    }
+    const detail = body ? ` ${String(body).slice(0, 180)}` : "";
+    reportImportIssue(
+      onIssue,
+      `Falha ao converter ${file?.name || "arquivo"} no servidor (${response.status}).${detail}`
+    );
+    return false;
+  }
+
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+  let glbBuffer = null;
+  let serverWarnings = [];
+
+  if (contentType.includes("application/json")) {
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      reportImportIssue(onIssue, `Resposta JSON invalida do servidor para ${file?.name || "arquivo"}.`);
+      return false;
+    }
+
+    if (Array.isArray(payload?.warnings)) serverWarnings = payload.warnings;
+    if (payload?.warning) serverWarnings.push(String(payload.warning));
+    if (payload?.error) {
+      reportImportIssue(onIssue, `Servidor retornou erro em ${file?.name || "arquivo"}: ${payload.error}`);
+      return false;
+    }
+
+    if (payload?.glbBase64) {
+      glbBuffer = decodeBase64ToArrayBuffer(payload.glbBase64);
+    } else if (payload?.glbUrl) {
+      try {
+        const glbResponse = await fetch(String(payload.glbUrl));
+        if (!glbResponse.ok) {
+          reportImportIssue(
+            onIssue,
+            `Nao foi possivel baixar GLB gerado para ${file?.name || "arquivo"} (${glbResponse.status}).`
+          );
+          return false;
+        }
+        glbBuffer = await glbResponse.arrayBuffer();
+      } catch (error) {
+        reportImportIssue(onIssue, `Falha ao baixar GLB gerado para ${file?.name || "arquivo"}.`);
+        return false;
+      }
+    } else {
+      reportImportIssue(
+        onIssue,
+        `Resposta JSON sem GLB para ${file?.name || "arquivo"} (esperado glbBase64 ou glbUrl).`
+      );
+      return false;
+    }
+  } else {
+    glbBuffer = await response.arrayBuffer();
+  }
+
+  for (const warning of serverWarnings) {
+    reportImportIssue(onIssue, `[servidor] ${String(warning)}`);
+  }
+
+  return addGlbToScene(glbBuffer, file?.name || "arquivo.dxf", autoCenter, onIssue);
+}
+
 function updateGlobalBounds() {
   bboxAll.makeEmpty();
   for (const child of partsGroup.children) {
@@ -2861,6 +2997,7 @@ function fitToScene(padding = 1.25) {
 // UI
 // ---------------------------
 const fileInput = document.getElementById("fileInput");
+const importModeEl = document.getElementById("importMode");
 const thicknessEl = document.getElementById("thickness");
 const autoCenterEl = document.getElementById("autoCenter");
 const fitBtn = document.getElementById("fitBtn");
@@ -2868,6 +3005,26 @@ const clearBtn = document.getElementById("clearBtn");
 const pieceCountEl = document.getElementById("pieceCount");
 const batchTimeEl = document.getElementById("batchTime");
 const selectedPieceEl = document.getElementById("selectedPiece");
+const IMPORT_MODE_STORAGE_KEY = "dxfViewer.importMode";
+const IMPORT_MODE_BROWSER = "browser";
+const IMPORT_MODE_SERVER_GLB = "server-glb";
+
+function normalizeImportMode(mode) {
+  return mode === IMPORT_MODE_SERVER_GLB ? IMPORT_MODE_SERVER_GLB : IMPORT_MODE_BROWSER;
+}
+
+function getSelectedImportMode() {
+  return normalizeImportMode(importModeEl?.value || IMPORT_MODE_BROWSER);
+}
+
+if (importModeEl) {
+  const savedMode = normalizeImportMode(localStorage.getItem(IMPORT_MODE_STORAGE_KEY));
+  importModeEl.value = savedMode;
+  importModeEl.addEventListener("change", () => {
+    const mode = getSelectedImportMode();
+    localStorage.setItem(IMPORT_MODE_STORAGE_KEY, mode);
+  });
+}
 
 function updatePieceCountBadge() {
   if (!pieceCountEl) return;
@@ -2925,45 +3082,65 @@ fileInput.addEventListener("change", async (ev) => {
   if (files.length === 0) return;
 
   const importStart = performance.now();
+  const importMode = getSelectedImportMode();
   const thickness = Number(thicknessEl.value || 5);
   const autoCenter = !!autoCenterEl.checked;
   const importIssues = [];
   let importedCount = 0;
 
-  const workerPool = getDxfWorkerPool();
-
-  await Promise.all(files.map(async (f) => {
-    let text = "";
-    try {
-      text = await decodeDxfFile(f);
-    } catch (decodeError) {
-      console.error("Falha inesperada no decode:", f?.name, decodeError);
-      importIssues.push(`Falha inesperada ao ler ${f?.name || "arquivo"}. Veja o console (F12).`);
-      return;
+  if (importMode === IMPORT_MODE_SERVER_GLB) {
+    for (const f of files) {
+      try {
+        const ok = await addDxfToSceneViaServerGlb(
+          f,
+          thickness,
+          autoCenter,
+          (msg) => importIssues.push(msg)
+        );
+        if (ok) importedCount += 1;
+      } catch (error) {
+        console.error("Falha inesperada no modo servidor GLB:", f?.name, error);
+        importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"} no modo servidor.`);
+      } finally {
+        updateBatchTimeBadge(performance.now() - importStart);
+      }
     }
+  } else {
+    const workerPool = getDxfWorkerPool();
 
-    const preParsed = workerPool
-      ? await parseDxfWithWorkers(text, f?.name || "")
-      : null;
+    await Promise.all(files.map(async (f) => {
+      let text = "";
+      try {
+        text = await decodeDxfFile(f);
+      } catch (decodeError) {
+        console.error("Falha inesperada no decode:", f?.name, decodeError);
+        importIssues.push(`Falha inesperada ao ler ${f?.name || "arquivo"}. Veja o console (F12).`);
+        return;
+      }
 
-    try {
-      const ok = addDxfToScene(
-        text,
-        f.name,
-        thickness,
-        autoCenter,
-        (msg) => importIssues.push(msg),
-        preParsed
-      );
-      if (ok) importedCount += 1;
-    } catch (error) {
-      console.error("Falha inesperada ao importar:", f?.name, error);
-      importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
-    } finally {
-      // Atualiza o tempo enquanto o lote ainda esta processando.
-      updateBatchTimeBadge(performance.now() - importStart);
-    }
-  }));
+      const preParsed = workerPool
+        ? await parseDxfWithWorkers(text, f?.name || "")
+        : null;
+
+      try {
+        const ok = addDxfToScene(
+          text,
+          f.name,
+          thickness,
+          autoCenter,
+          (msg) => importIssues.push(msg),
+          preParsed
+        );
+        if (ok) importedCount += 1;
+      } catch (error) {
+        console.error("Falha inesperada ao importar:", f?.name, error);
+        importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
+      } finally {
+        // Atualiza o tempo enquanto o lote ainda esta processando.
+        updateBatchTimeBadge(performance.now() - importStart);
+      }
+    }));
+  }
 
   const importDurationMs = performance.now() - importStart;
   updateBatchTimeBadge(importDurationMs);

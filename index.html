@@ -32,6 +32,14 @@
 
     <div class="right">
       <label class="row">
+        Modo importacao
+        <select id="importMode">
+          <option value="browser">Atual (Browser DXF)</option>
+          <option value="server-glb">Nova (Servidor GLB)</option>
+        </select>
+      </label>
+
+      <label class="row">
         Espessura (Z)
         <input id="thickness" type="number" value="5" min="0.1" step="0.1" />
       </label>
@@ -49,6 +57,6 @@
     Mouse: <b>Esq</b> orbitar | <b>Meio</b> zoom | <b>Dir</b> pan
   </div>
 
-  <script type="module" src="./app.js?v=legacyfix22"></script>
+  <script type="module" src="./app.js?v=legacyfix23"></script>
 </body>
 </html>
