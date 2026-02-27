@@ -250,7 +250,7 @@ Se houver erro de autenticacao no push, configurar credencial/token do GitHub no
   - validar se veio em `LINE/ARC` aberto e revisar logs de stitch/hierarquia
 - Erro `Falha ao converter ... no servidor (501)`:
   - isso ocorre quando esta rodando apenas servidor estatico sem API
-  - o app agora troca automaticamente para `Atual (Browser DXF)` para nao bloquear importacao
+  - o app faz fallback silencioso para o pipeline browser no arquivo atual, sem trocar o modo selecionado no topo
 
 ## 16. Casos resolvidos
 
@@ -311,8 +311,9 @@ Objetivo:
 
 Comportamento de seguranca:
 - se o endpoint de servidor nao existir (ex.: servidor estatico `python -m http.server`),
-  o frontend detecta status como `404/405/501` ou resposta HTML e volta automaticamente
-  para `Atual (Browser DXF)`.
+  o frontend detecta status como `404/405/501` ou resposta HTML e faz fallback
+  silencioso para o pipeline browser no arquivo atual, mantendo o modo selecionado
+  no topo para voce alterar manualmente quando quiser.
 
 ## 18. Backend recomendado (EZDXF + cache GLB)
 

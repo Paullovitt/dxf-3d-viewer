@@ -2873,18 +2873,13 @@ async function addGlbToScene(arrayBuffer, filename, autoCenter = true, onIssue =
   return finalizeImportedGroup(localGroup, autoCenter);
 }
 
-let serverModeFallbackNotified = false;
+const serverModeFallbackLogged = new Set();
 
-function switchImportModeToBrowser(onIssue = null, reason = "") {
-  if (importModeEl && importModeEl.value !== IMPORT_MODE_BROWSER) {
-    importModeEl.value = IMPORT_MODE_BROWSER;
-    localStorage.setItem(IMPORT_MODE_STORAGE_KEY, IMPORT_MODE_BROWSER);
-  }
-
-  if (reason && !serverModeFallbackNotified) {
-    reportImportIssue(onIssue, reason);
-    serverModeFallbackNotified = true;
-  }
+function logServerFallbackOnce(reason = "") {
+  const key = String(reason || "generic");
+  if (serverModeFallbackLogged.has(key)) return;
+  serverModeFallbackLogged.add(key);
+  if (reason) console.warn("[server-glb fallback]", reason);
 }
 
 function looksLikeHtmlBody(text) {
@@ -2941,10 +2936,8 @@ async function addDxfToSceneViaServerGlb(file, thickness, autoCenter = true, onI
     });
   } catch (error) {
     console.error("Falha de rede no endpoint GLB:", error);
-    switchImportModeToBrowser(
-      onIssue,
-      `Modo servidor indisponivel (endpoint ${endpoint} sem resposta). ` +
-      "Voltando automaticamente para 'Atual (Browser DXF)'."
+    logServerFallbackOnce(
+      `Endpoint ${endpoint} sem resposta; usando pipeline browser para ${file?.name || "arquivo"}.`
     );
     return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
   }
@@ -2966,10 +2959,9 @@ async function addDxfToSceneViaServerGlb(file, thickness, autoCenter = true, onI
       looksLikeHtmlBody(body);
 
     if (unsupportedApi) {
-      switchImportModeToBrowser(
-        onIssue,
-        `Endpoint ${endpoint} nao esta ativo neste servidor (status ${response.status}). ` +
-        "Voltando automaticamente para 'Atual (Browser DXF)'."
+      logServerFallbackOnce(
+        `Endpoint ${endpoint} nao ativo (status ${response.status}); ` +
+        `usando pipeline browser para ${file?.name || "arquivo"}.`
       );
       return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
     }
@@ -2982,10 +2974,9 @@ async function addDxfToSceneViaServerGlb(file, thickness, autoCenter = true, onI
 
   const contentType = String(response.headers.get("content-type") || "").toLowerCase();
   if (contentType.includes("text/html")) {
-    switchImportModeToBrowser(
-      onIssue,
-      `Resposta HTML inesperada do endpoint ${endpoint}. ` +
-      "Voltando automaticamente para 'Atual (Browser DXF)'."
+    logServerFallbackOnce(
+      `Resposta HTML inesperada do endpoint ${endpoint}; ` +
+      `usando pipeline browser para ${file?.name || "arquivo"}.`
     );
     return importSingleFileBrowserPipeline(file, thickness, autoCenter, onIssue);
   }
