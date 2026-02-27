@@ -204,6 +204,23 @@ Antes de alterar regra:
 
 Regra: evitar ajuste por chute.
 
+### 12.1 Protocolo obrigatorio (olhar, ver, analisar e so depois corrigir)
+
+Para qualquer bug de geometria, seguir sempre:
+1. olhar o resultado no viewer e comparar com o CAD de referencia (ex.: FreeCAD)
+2. verificar se o erro esta no contorno externo, nos furos, na hierarquia ou no fallback
+3. analisar os dados reais do DXF (tipos de entidade, loops fechados, areas, depth pai/filho)
+4. formular hipotese tecnica com base nos dados (nao em tentativa aleatoria)
+5. testar a hipotese no arquivo problematico e em arquivos de controle
+6. aplicar a menor correcao possivel, localizada no ponto da causa raiz
+7. validar novamente no arquivo original e em casos ja resolvidos (anti-regressao)
+8. documentar no README: sintoma, causa raiz, correcao e commit
+
+Regras de decisao:
+- se nao reproduziu, nao alterar regra global
+- se nao mediu, nao concluir causa
+- se nao validou em mais de um arquivo, nao considerar resolvido
+
 ## 13. Estrutura de arquivos
 
 - `index.html`: shell da UI + importmap + cache-bust de script.
