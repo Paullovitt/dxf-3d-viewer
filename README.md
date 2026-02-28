@@ -1,307 +1,122 @@
-# DXF 3D Viewer
+﻿# DXF 3D Viewer - CEF + Backend Nativo (TESTE)
 
-Visualizador/importador de pecas DXF em 3D (Three.js), focado em arquivos CNC com geometria mista (`LWPOLYLINE`, `POLYLINE`, `LINE`, `ARC`, `CIRCLE`, `SPLINE`) e correcoes para DXF imperfeito.
+Versao nova criada em `C:\Users\USER\Downloads\dxf-3d-viewer\TESTE` sem alterar o projeto original.
 
-## 1. Objetivo
+## Arquitetura
 
-Este projeto importa DXFs 2D, reconstrui contornos validos (borda + furos) e gera malhas 3D extrudadas.
+- Frontend: `frontend/index.html`, `frontend/styles.css`, `frontend/app.js` (apenas interface/renderizacao).
+- Backend nativo: `backend/server.py` (parse DXF pesado, cache, modo CPU/CUDA).
+- Desktop: `run_cef.py` (abre Chromium embutido via CEF, sem depender de Chrome instalado no Windows).
 
-Prioridades do projeto:
-- fidelidade de contorno (evitar preencher furo por erro de loop)
-- robustez para arquivos CAD "sujos"
-- desempenho aceitavel para chapas com muitos furos
+## Modo de processamento
 
-## 2. Requisitos
+No topo da UI existe `Processamento`:
 
-- Navegador moderno com suporte a ES Modules e Web Workers.
-- Servidor HTTP local (nao abrir `index.html` via `file://`).
+- `CPU`: parse backend em CPU.
+- `CUDA (GPU)`: backend tenta usar CUDA nas etapas numericas suportadas.
+  - Se CUDA/CuPy nao estiver disponivel, backend faz fallback automatico para CPU e informa no payload.
 
-## 3. Bibliotecas e APIs usadas
+## Cache backend
 
-Bibliotecas externas:
-- `three@0.160.0` via importmap (`index.html`)
-- `OrbitControls` e `TransformControls` (addons do Three)
-- `dxf-parser@1.1.2` via `esm.sh` (fallback de parse)
+- Cache em disco: `.cache/parsed`
+- Chave de cache: hash do arquivo + modo efetivo (`cpu`/`cuda`) + versao do parser.
+- Cache em RAM (LRU): aloca agressivamente uma fracao da RAM total para reutilizar parse pronto sem reprocessar.
 
-APIs nativas do browser:
-- `Web Worker` para parse em paralelo (`dxf-worker.js`)
-- `FileReader` / `TextDecoder` para leitura dos arquivos
-- WebGL via `THREE.WebGLRenderer`
+## Como rodar
 
-## 4. Como executar
+Na pasta `TESTE`:
 
-### 4.1 Modo atual (somente frontend / estatico)
-
-Na pasta do projeto:
-
-```bash
-python -m http.server 5173
+```powershell
+py -3.9 -m pip install -r requirements.txt
+py -3.9 run_cef.py
 ```
 
-Abrir:
+Observacao:
+- `run_cef.py` tenta relancar automaticamente em Python 3.9 quando executado em outra versao.
+- Ordem de abertura desktop: Google Chrome (`--app`) -> CEF -> Playwright.
 
-`http://127.0.0.1:5173`
+Se quiser rodar sem CEF (somente servidor + browser manual):
 
-Observacao: apos atualizar `app.js`, use `Ctrl + F5` para evitar cache antigo.
-
-## 5. Fluxo de execucao (alto nivel)
-
-1. Usuario seleciona um ou varios DXFs.
-2. Arquivo e decodificado (`utf-8` com fallback `utf-16le` e `latin1`).
-3. Parse preliminar no worker (`parseDxfAsciiCnc` em `dxf-worker.js`).
-4. Import principal em `importWithCncContours(...)` (`app.js`).
-5. Reconstrucao de loops fechados + hierarquia contorno/furo.
-6. Geracao de `THREE.Shape` e extrusao (`THREE.ExtrudeGeometry`).
-7. Adicao da peca na cena + layout automatico + cache de bounds.
-
-Fallback:
-- Se o fluxo principal falhar, entra `dxf-parser` (CDN) e aplica mesma logica de fechamento/reparo no `app.js`.
-
-## 6. Pipeline DXF detalhado
-
-### 6.1 Parse ASCII CNC (worker)
-
-Arquivo: `dxf-worker.js`
-
-- Le entidades na secao `ENTITIES`.
-- Converte:
-  - `LINE` -> segmento aberto
-  - `ARC` -> polilinha discretizada
-  - `CIRCLE` -> loop fechado
-  - `LWPOLYLINE`/`POLYLINE` -> pontos com suporte a `bulge`
-  - `SPLINE` -> aproximacao por pontos
-- Limpa ruido (`cleanImportedContoursCnc`) com:
-  - deduplicacao de pontos consecutivos
-  - remocao de contornos degenerados
-  - stitch de contornos abertos por tolerancia
-  - filtragem de grupos desconectados irrelevantes
-- Normaliza coordenadas para origem local (minX/minY).
-
-### 6.2 Reconstrucao de loops (app)
-
-Arquivo: `app.js`
-
-Funcoes centrais:
-- `extractClosedLoopsFromSegments(...)`
-- `stitchClosedLoopsFromOpenContours(...)`
-- `findDominantOuterLoopFromOpenContours(...)`
-- `buildShapesFromClosedLoops(...)`
-
-Tolerancias progressivas de fechamento por segmentos:
-- `1e-4`
-- `1e-2`
-- `5e-2`
-
-### 6.3 Reparse para modo bruto LINE/ARC
-
-Quando o padrao indica chapa com muitos abertos e poucos fechados grandes,
-o import reprocessa com `preferSimple: true` para preservar geometria.
-
-## 7. Regras geometricas e correcoes aplicadas
-
-### 7.1 Hierarquia contorno x furo
-
-- Cada loop recebe pai/filho por inclusao geometrica (bbox + point-in-polygon estrito).
-- Profundidade par = contorno externo.
-- Profundidade impar = furo.
-
-### 7.2 Pseudo-furo (container duplicado)
-
-Caso comum de export CAD:
-- borda duplicada interna muito grande + varios furos pequenos.
-
-Tratamento:
-- o container duplicado e marcado para skip
-- netos (furos reais) sao promovidos ao pai correto
-
-### 7.3 Chapa perfurada densa
-
-Deteccao de padrao denso:
-- escolhe maior contorno como possivel borda
-- coleta candidatos de furos internos pequenos
-- deduplica por celula de centro
-- monta `Shape` com 1 borda + N furos
-
-### 7.4 Correcao de loop composto (causa raiz do preenchimento indevido)
-
-Problema real identificado:
-- alguns furos vinham como loop composto (duas voltas no mesmo caminho,
-  com pontos repetidos e auto-intersecao).
-- triangulacao desses loops podia preencher trechos internos errados.
-
-Correcao aplicada:
-- `splitCompoundLoopCandidates(...)` em `buildShapesFromClosedLoops(...)`
-- detecta loop suspeito por:
-  - repeticao nao adjacente de ponto
-  - `area/bbox` fora de faixa valida
-- explode o loop em subloops via segmentos
-- deduplica por centro de furo e preserva so a melhor representacao
-
-Resultado:
-- furos internos passam a ser tratados como furos em ambos os lados da chapa
-- evita "mancha preenchida" parcial em paineis perfurados
-
-### 7.5 Filtro de overlay interno artefato
-
-Mesmo apos hierarquia, se houver shape interno com baixa densidade de furos,
-contido no shape dominante perfurado, ele e descartado como artefato.
-
-### 7.6 Guarda para pecas longas/curvas (evitar hull falso)
-
-Problema observado em pecas tipo barra curva (ex.: `212376`):
-- o `hull fallback` podia adicionar um contorno convexo extra
-- isso gerava uma shape falsa preenchida por cima da peca real
-
-Correcao aplicada:
-- antes de adicionar hull, o algoritmo detecta se ja existe contorno pai forte
-  contendo os demais loops internos (furos)
-- se esse contorno forte existe, o hull nao e criado
-
-Resultado:
-- peca curva mantem apenas a shape valida (borda + furos)
-- evita \"triangulo/chapa\" preenchida indevida em geometrias esbeltas
-
-## 8. Selecao, edicao e atalhos
-
-- Clique: seleciona peca.
-- Gizmo (`TransformControls`): mover peca selecionada.
-- `Delete`/`Backspace`: excluir peca selecionada.
-- `Esc`: limpar selecao.
-
-A borda de selecao e calculada a partir dos shapes finais (nao de loops crus),
-evita highlight desalinhado.
-
-## 9. Layout automatico de multiplas pecas
-
-As pecas entram em grade no quadrante superior (X/Y), com camadas negativas em Z
-quando necessario, para reduzir sobreposicao.
-
-## 10. Performance
-
-Melhorias implementadas:
-- parse em worker pool (`navigator.hardwareConcurrency`)
-- reducao adaptativa de `curveSegments` conforme quantidade de furos
-- filtros para remover loops/overlays espurios antes da extrusao
-- cache persistente de parse DXF em `IndexedDB` (reaproveita contornos entre aberturas)
-- cache persistente da malha extrudada (`BufferGeometry`) por `arquivo + espessura`
-
-Efeito esperado:
-- menos travamento em chapas com centenas/milhares de furos
-- menor custo de triangulacao desnecessaria
-- reabertura mais rapida da mesma peca (mesmo apos `F5` e botao `Limpar`)
-- o topo mostra `Cache M:H/M/S P:H/M/S` para confirmar uso de cache de malha (M) e parse (P)
-
-## 11. Avisos e mensagens de importacao
-
-O sistema avisa quando:
-- nao encontra entidade fechada valida
-- fecha contornos abertos automaticamente
-- um arquivo do lote foi ignorado
-
-No lote, os avisos sao agregados em resumo unico para reduzir popups.
-
-## 12. Estrategia de diagnostico (padrao do projeto)
-
-Antes de alterar regra:
-1. reproduzir com DXF real do usuario
-2. medir dados (quantidade de loops, depth, area, distribuicao por lado)
-3. identificar causa geometrica especifica
-4. aplicar correcao pontual e validar em outros DXFs
-
-Regra: evitar ajuste por chute.
-
-### 12.1 Protocolo obrigatorio (olhar, ver, analisar e so depois corrigir)
-
-Para qualquer bug de geometria, seguir sempre:
-1. olhar o resultado no viewer e comparar com o CAD de referencia (ex.: FreeCAD)
-2. verificar se o erro esta no contorno externo, nos furos, na hierarquia ou no fallback
-3. analisar os dados reais do DXF (tipos de entidade, loops fechados, areas, depth pai/filho)
-4. formular hipotese tecnica com base nos dados (nao em tentativa aleatoria)
-5. testar a hipotese no arquivo problematico e em arquivos de controle
-6. aplicar a menor correcao possivel, localizada no ponto da causa raiz
-7. validar novamente no arquivo original e em casos ja resolvidos (anti-regressao)
-8. documentar no README: sintoma, causa raiz, correcao e commit
-
-Regras de decisao:
-- se nao reproduziu, nao alterar regra global
-- se nao mediu, nao concluir causa
-- se nao validou em mais de um arquivo, nao considerar resolvido
-
-## 13. Estrutura de arquivos
-
-- `index.html`: shell da UI + importmap + cache-bust de script.
-- `styles.css`: tema e layout visual.
-- `app.js`: cena, interacao, pipeline de importacao e fallback.
-- `dxf-worker.js`: parser ASCII CNC em worker.
-
-## 14. Publicacao no GitHub (fluxo rapido)
-
-```bash
-git add app.js index.html README.md
-git commit -m "Fix DXF perforated holes normalization and document full pipeline"
-git push origin main
+```powershell
+python run_server.py
 ```
 
-Se houver erro de autenticacao no push, configurar credencial/token do GitHub no ambiente local.
+Abrir: `http://127.0.0.1:5173`
 
-## 15. Troubleshooting
+## Pacote portatil (sem baixar dependencias na outra maquina)
 
-- Geometria antiga no navegador:
-  - `Ctrl + F5`
-- Limpar cache persistente (parse + malha):
-  - DevTools -> Application -> Storage (ou IndexedDB) -> limpar dados do site
-- Import falhando:
-  - abrir `F12` e conferir tipos de entidade detectados
-- Pecas sobrepostas:
-  - usar `Enquadrar (Fit)` e verificar `Centro automatico`
-- DXF com canto/furo estranho:
-  - validar se veio em `LINE/ARC` aberto e revisar logs de stitch/hierarquia
-## 16. Casos resolvidos
+Agora existe um build portatil que empacota:
 
-### Caso A - Painel perfurado preenchendo lado interno (ex.: `210921`)
+- Projeto (`backend`, `frontend`, `run_cef.py`, `run_server.py`)
+- Runtime Python 3.9 local completo
+- Dependencias ja instaladas no seu Python 3.9 (FastAPI, ezdxf, CuPy, CEF etc)
+- Runtime CUDA local (`CUDA v12.0 bin/libnvvp`), quando disponivel
 
-- Sintoma:
-  - parte interna do painel aparecia \"pintada\" em um lado, enquanto no FreeCAD os furos estavam corretos
-- Causa raiz:
-  - varios furos vieram como loop composto/auto-intersectante (duas voltas no mesmo caminho), gerando triangulacao invalida
-- Correcao:
-  - normalizacao de loop composto em `buildShapesFromClosedLoops(...)` via `splitCompoundLoopCandidates(...)`
-  - deduplicacao por centro de furo para manter uma representacao valida por cavidade
-- Resultado:
-  - furos passaram a ser reconhecidos corretamente dos dois lados, sem preenchimento falso
-- Commit:
-  - `d7ceece`
+### Gerar pacote portatil
 
-### Caso B - Barra curva gerando chapa falsa preenchida (peca `212376`)
+Na pasta `TESTE`:
 
-- Sintoma:
-  - geometria correta no FreeCAD, mas no viewer aparecia uma shape grande preenchida por cima da peca curva
-- Causa raiz:
-  - `hull fallback` adicionava um contorno convexo extra, mesmo ja existindo contorno pai valido com furos internos
-- Correcao:
-  - guarda de `hull fallback` com deteccao de \"strong container contour\" antes de criar hull
-- Resultado:
-  - peca passou a sair com 1 shape valida + furos, sem overlay preenchido
-- Commit:
-  - `291da5c`
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_portable.ps1
+```
 
-### Caso C - Pecas com `LINE/ARC` e furos pequenos (ex.: `212414`, `212541`, `212232`, `212336`)
+Opcional (sem copiar CUDA toolkit):
 
-- Sintoma:
-  - contorno/furos inconsistentes dependendo da regiao da peca
-- Causa raiz:
-  - export CAD com combinacao de contornos abertos + loops internos duplicados
-- Correcao:
-  - reparse em modo bruto `LINE/ARC` quando detectado padrao de chapa
-  - normalizacao de pseudo-containers e ajuste de hierarquia contorno/furo
-- Resultado:
-  - importacao consistente dessas pecas, com furos e bordas preservados
-- Commit:
-  - `d7ceece`
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_portable.ps1 -SkipCuda
+```
 
-## 17. Modo importacao
+Saida padrao:
 
-No topo da tela existe `Modo importacao` com uma opcao:
+- `TESTE\release-portable`
 
-- `Atual (Browser DXF)`:
-  - usa o pipeline JS atual (`dxf-worker.js` + fallback `dxf-parser`)
+### Rodar pacote portatil em outra maquina
+
+Na pasta `release-portable`:
+
+- `start_portable.bat`: abre app desktop
+- `start_server_portable.bat`: sobe servidor web
+- `check_portable_env.bat`: valida runtime Python/CUDA/CuPy/backend
+
+### O que ainda depende da maquina destino
+
+- Driver NVIDIA/Windows precisa existir para CUDA funcionar de fato.
+- Sem driver GPU compativel, o app abre e cai automaticamente para modo CPU.
+- Nao precisa instalar Python, pip, fastapi, ezdxf, cupy nem CUDA toolkit na maquina destino (ja vao no pacote).
+
+## CUDA opcional
+
+Para habilitar o caminho CUDA de fato, instale CuPy compatível com sua placa/driver (exemplo CUDA 12):
+
+```powershell
+pip install cupy-cuda12x
+```
+
+Sem CuPy/CUDA, a opcao `CUDA` continua disponivel para teste, mas cai para CPU automaticamente.
+
+## Observacoes de performance
+
+- Parse pesado foi movido para backend.
+- Frontend importa via API `/api/parse-dxf`.
+- Importacao em lote no frontend agora e paralela (usa os nucleos disponiveis como base de concorrencia).
+- Backend usa pool de processos para CPU e CUDA (configuravel), com parse paralelo.
+- Modo CUDA tenta empurrar para GPU as etapas numericas (normalizacao vetorial, bounds e vetorizacoes suportadas).
+- Fallback de robustez: frontend ainda pode usar texto DXF local apenas se necessario para montagem final.
+
+## Ajuste de "modo bruto" (maximo desempenho)
+
+Variaveis de ambiente opcionais:
+
+- `DXF_CPU_WORKERS`: numero de workers CPU (padrao: total de nucleos logicos).
+- `DXF_CUDA_WORKERS`: numero de workers em modo CUDA (padrao: total de nucleos logicos quando CUDA esta disponivel).
+- `DXF_CACHE_RAM_FRACTION`: fracao da RAM total reservada para cache em memoria (`0.05` a `0.95`, padrao `0.85`).
+- `DXF_CACHE_RAM_MIN_MB`: minimo de cache em RAM em MB (padrao `512`).
+
+Exemplo:
+
+```powershell
+$env:DXF_CPU_WORKERS="24"
+$env:DXF_CUDA_WORKERS="24"
+$env:DXF_CACHE_RAM_FRACTION="0.90"
+py -3.9 run_cef.py
+```

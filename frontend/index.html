@@ -35,7 +35,15 @@
       <label class="row">
         Modo importacao
         <select id="importMode">
-          <option value="browser">Atual (Browser DXF)</option>
+          <option value="backend">Backend Nativo (CEF)</option>
+        </select>
+      </label>
+
+      <label class="row">
+        Processamento
+        <select id="computeMode">
+          <option value="cuda" selected>CUDA (GPU)</option>
+          <option value="cpu">CPU</option>
         </select>
       </label>
 
@@ -57,6 +65,6 @@
     Mouse: <b>Esq</b> orbitar | <b>Meio</b> zoom | <b>Dir</b> pan
   </div>
 
-  <script type="module" src="./app.js?v=legacyfix31"></script>
+  <script type="module" src="./app.js?v=cefbackend1"></script>
 </body>
 </html>

@@ -76,6 +76,7 @@ const LAYOUT_PUSH_STEP = 18;
 const EPS = 1e-6;
 const CPU_CORES = Math.max(1, Number(navigator.hardwareConcurrency || 1));
 const DXF_PARSE_WORKERS = Math.max(1, CPU_CORES);
+const BACKEND_IMPORT_CONCURRENCY = Math.max(1, CPU_CORES);
 const DXF_CACHE_DB_NAME = "dxf-3d-viewer-cache";
 const DXF_PARSE_CACHE_STORE_NAME = "parsed-contours";
 const DXF_MESH_CACHE_STORE_NAME = "mesh-groups";
@@ -2948,6 +2949,7 @@ function buildShapesFromClosedLoops(closedLoops, allPoints, options = {}) {
 
 function importWithCncContours(dxfText, filename, thickness, material, localGroup, onIssue = null, preParsed = null) {
   let parsed = preParsed;
+  const parsedFromBackend = !!preParsed;
   if (!parsed) {
     try {
       parsed = parseDxfAsciiCnc(dxfText);
@@ -2957,7 +2959,7 @@ function importWithCncContours(dxfText, filename, thickness, material, localGrou
     }
   }
   let rawLineArcMode = false;
-  if (shouldReparseInRawLineArcMode(parsed)) {
+  if (!parsedFromBackend && shouldReparseInRawLineArcMode(parsed)) {
     try {
       const rawParsed = parseDxfAsciiCnc(dxfText, { preferSimple: true });
       if (rawParsed?.contours?.length > 0) {
@@ -3501,6 +3503,78 @@ async function importSingleFileBrowserPipeline(
   }
 }
 
+async function importSingleFileBackendPipeline(
+  file,
+  thickness,
+  computeMode = "cuda",
+  autoCenter = true,
+  onIssue = null,
+  onCacheEvent = null
+) {
+  let payload = null;
+  try {
+    const form = new FormData();
+    form.append("file", file, file?.name || "arquivo.dxf");
+    form.append("compute_mode", String(computeMode || "cuda").toLowerCase());
+
+    const response = await fetch("/api/parse-dxf", {
+      method: "POST",
+      body: form,
+    });
+    payload = await response.json();
+    if (!response.ok || !payload?.ok) {
+      throw new Error(String(payload?.detail || payload?.error || `HTTP ${response.status}`));
+    }
+  } catch (error) {
+    console.error("Falha no backend de parse:", file?.name, error);
+    reportImportIssue(onIssue, `Falha no backend ao importar ${file?.name || "arquivo"}.`);
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: "parse-error", fileName: file?.name || "" });
+    }
+    return false;
+  }
+
+  const parsed = payload?.parsed;
+  if (!parsed || !Array.isArray(parsed.contours) || parsed.contours.length < 1) {
+    reportImportIssue(onIssue, `Backend retornou parse vazio para ${file?.name || "arquivo"}.`);
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: "parse-error", fileName: file?.name || "" });
+    }
+    return false;
+  }
+
+  if (typeof onCacheEvent === "function") {
+    onCacheEvent({
+      type: payload?.fromCache ? "parse-hit" : "parse-miss",
+      fileName: file?.name || "",
+      usedMode: String(payload?.usedMode || "cpu"),
+    });
+  }
+
+  let fallbackDxfText = "";
+  try {
+    const fallbackBuffer = await file.arrayBuffer();
+    fallbackDxfText = decodeDxfArrayBuffer(fallbackBuffer, file?.name || "");
+  } catch (_error) {
+    fallbackDxfText = "";
+  }
+
+  try {
+    return addDxfToScene(
+      fallbackDxfText,
+      file?.name || "arquivo.dxf",
+      thickness,
+      autoCenter,
+      onIssue,
+      parsed
+    );
+  } catch (error) {
+    console.error("Falha ao montar malha com parse do backend:", file?.name, error);
+    reportImportIssue(onIssue, `Falha ao montar malha de ${file?.name || "arquivo"}.`);
+    return false;
+  }
+}
+
 function updateGlobalBounds() {
   bboxAll.makeEmpty();
   for (const child of partsGroup.children) {
@@ -3534,6 +3608,7 @@ function fitToScene(padding = 1.25) {
 // ---------------------------
 const fileInput = document.getElementById("fileInput");
 const importModeEl = document.getElementById("importMode");
+const computeModeEl = document.getElementById("computeMode");
 const thicknessEl = document.getElementById("thickness");
 const autoCenterEl = document.getElementById("autoCenter");
 const fitBtn = document.getElementById("fitBtn");
@@ -3542,10 +3617,19 @@ const pieceCountEl = document.getElementById("pieceCount");
 const batchTimeEl = document.getElementById("batchTime");
 const cacheStatsEl = document.getElementById("cacheStats");
 const selectedPieceEl = document.getElementById("selectedPiece");
-const IMPORT_MODE_BROWSER = "browser";
+const IMPORT_MODE_BACKEND = "backend";
+const DEFAULT_COMPUTE_MODE = "cuda";
 
 if (importModeEl) {
-  importModeEl.value = IMPORT_MODE_BROWSER;
+  importModeEl.value = IMPORT_MODE_BACKEND;
+  importModeEl.disabled = true;
+}
+
+if (computeModeEl) {
+  const hasCudaOption = Array.from(computeModeEl.options || []).some(
+    (opt) => String(opt?.value || "").toLowerCase() === DEFAULT_COMPUTE_MODE
+  );
+  computeModeEl.value = hasCudaOption ? DEFAULT_COMPUTE_MODE : "cpu";
 }
 
 function updatePieceCountBadge() {
@@ -3566,16 +3650,13 @@ function updateCacheStatsBadge(stats = null) {
     return;
   }
 
-  const meshHits = Number(stats.meshHits || 0);
-  const meshMisses = Number(stats.meshMisses || 0);
-  const meshSaves = Number(stats.meshSaves || 0);
   const parseHits = Number(stats.parseHits || 0);
   const parseMisses = Number(stats.parseMisses || 0);
-  const parseSaves = Number(stats.parseSaves || 0);
   const errors = Number(stats.errors || 0);
+  const mode = String(stats.mode || "cpu").toUpperCase();
 
   cacheStatsEl.textContent =
-    `Cache M:${meshHits}/${meshMisses}/${meshSaves} P:${parseHits}/${parseMisses}/${parseSaves}` +
+    `Cache P:${parseHits}/${parseMisses} | ${mode}` +
     (errors > 0 ? ` ERR:${errors}` : "");
 }
 
@@ -3624,56 +3705,71 @@ function decodeDxfArrayBuffer(arrayBuffer, filename = "") {
   return String(text || "").replace(/\u0000/g, "");
 }
 
+async function runWithConcurrency(items, limit, task) {
+  const list = Array.isArray(items) ? items : Array.from(items || []);
+  if (list.length === 0) return;
+
+  const maxWorkers = Math.max(1, Math.min(Number(limit || 1), list.length));
+  let nextIndex = 0;
+
+  async function workerLoop() {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= list.length) return;
+      await task(list[current], current);
+    }
+  }
+
+  const running = [];
+  for (let i = 0; i < maxWorkers; i += 1) running.push(workerLoop());
+  await Promise.all(running);
+}
+
 fileInput.addEventListener("change", async (ev) => {
   const files = [...(ev.target.files || [])];
   if (files.length === 0) return;
 
   const importStart = performance.now();
   const thickness = Number(thicknessEl.value || 5);
+  const computeMode = String(computeModeEl?.value || DEFAULT_COMPUTE_MODE).toLowerCase();
   const autoCenter = !!autoCenterEl.checked;
   const importIssues = [];
   const cacheStats = {
-    meshHits: 0,
-    meshMisses: 0,
-    meshSaves: 0,
     parseHits: 0,
     parseMisses: 0,
-    parseSaves: 0,
-    errors: 0
+    errors: 0,
+    mode: computeMode,
   };
   let importedCount = 0;
-  const workerPool = getDxfWorkerPool();
   updateCacheStatsBadge(cacheStats);
 
-  await Promise.all(files.map(async (f) => {
+  await runWithConcurrency(files, BACKEND_IMPORT_CONCURRENCY, async (f) => {
     try {
-      const ok = await importSingleFileBrowserPipeline(
+      const ok = await importSingleFileBackendPipeline(
         f,
         thickness,
+        computeMode,
         autoCenter,
         (msg) => importIssues.push(msg),
-        workerPool,
         (event) => {
           const type = String(event?.type || "");
-          if (type === "mesh-hit") cacheStats.meshHits += 1;
-          else if (type === "mesh-miss") cacheStats.meshMisses += 1;
-          else if (type === "mesh-save") cacheStats.meshSaves += 1;
-          else if (type === "parse-hit") cacheStats.parseHits += 1;
+          if (type === "parse-hit") cacheStats.parseHits += 1;
           else if (type === "parse-miss") cacheStats.parseMisses += 1;
-          else if (type === "parse-save") cacheStats.parseSaves += 1;
           else if (type.endsWith("-failed")) cacheStats.errors += 1;
+          else if (type === "parse-error") cacheStats.errors += 1;
+          if (event?.usedMode) cacheStats.mode = String(event.usedMode).toLowerCase();
           updateCacheStatsBadge(cacheStats);
         }
       );
       if (ok) importedCount += 1;
     } catch (error) {
-      console.error("Falha inesperada no modo browser DXF:", f?.name, error);
+      console.error("Falha inesperada no modo backend DXF:", f?.name, error);
       importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
     } finally {
-      // Atualiza o tempo enquanto o lote ainda esta processando.
       updateBatchTimeBadge(performance.now() - importStart);
     }
-  }));
+  });
 
   const importDurationMs = performance.now() - importStart;
   updateBatchTimeBadge(importDurationMs);
