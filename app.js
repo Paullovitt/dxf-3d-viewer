@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { STLLoader } from "three/addons/loaders/STLLoader.js";
 
 // DXF parser (CDN)
 import DxfParser from "https://esm.sh/dxf-parser@1.1.2";
@@ -86,6 +87,8 @@ const DXF_PARSE_CACHE_MAX_ENTRIES = 120;
 const DXF_PARSE_CACHE_MAX_BYTES = 80 * 1024 * 1024;
 const DXF_MESH_CACHE_MAX_ENTRIES = 32;
 const DXF_MESH_CACHE_MAX_BYTES = 280 * 1024 * 1024;
+const STEP_MESH_CACHE_PIPELINE_VERSION = "step-mesh-v1";
+const STEP_PARSE_TIMEOUT_MS = 60000;
 const DXF_CACHE_STORE_NAME = DXF_PARSE_CACHE_STORE_NAME;
 const DXF_CACHE_PIPELINE_VERSION = DXF_PARSE_CACHE_PIPELINE_VERSION;
 const DXF_CACHE_MAX_ENTRIES = DXF_PARSE_CACHE_MAX_ENTRIES;
@@ -308,6 +311,11 @@ function buildParsedCacheKeyFromHash(hash) {
 function buildMeshCacheKeyFromHash(hash, thickness) {
   if (!hash) return "";
   return `${DXF_MESH_CACHE_PIPELINE_VERSION}:${hash}:t=${Number(thickness)}`;
+}
+
+function buildStepMeshCacheKeyFromHash(hash) {
+  if (!hash) return "";
+  return `${STEP_MESH_CACHE_PIPELINE_VERSION}:${hash}`;
 }
 
 async function buildParsedCacheKey(arrayBuffer) {
@@ -3533,6 +3541,7 @@ function fitToScene(padding = 1.25) {
 // UI
 // ---------------------------
 const fileInput = document.getElementById("fileInput");
+const stepInput = document.getElementById("stepInput");
 const importModeEl = document.getElementById("importMode");
 const thicknessEl = document.getElementById("thickness");
 const autoCenterEl = document.getElementById("autoCenter");
@@ -3572,17 +3581,21 @@ function updateCacheStatsBadge(stats = null) {
   const parseHits = Number(stats.parseHits || 0);
   const parseMisses = Number(stats.parseMisses || 0);
   const parseSaves = Number(stats.parseSaves || 0);
+  const stepMeshHits = Number(stats.stepMeshHits || 0);
+  const stepMeshMisses = Number(stats.stepMeshMisses || 0);
+  const stepMeshSaves = Number(stats.stepMeshSaves || 0);
   const errors = Number(stats.errors || 0);
 
   cacheStatsEl.textContent =
-    `Cache M:${meshHits}/${meshMisses}/${meshSaves} P:${parseHits}/${parseMisses}/${parseSaves}` +
+    `Cache DXF M:${meshHits}/${meshMisses}/${meshSaves} P:${parseHits}/${parseMisses}/${parseSaves}` +
+    ` | STEP M:${stepMeshHits}/${stepMeshMisses}/${stepMeshSaves}` +
     (errors > 0 ? ` ERR:${errors}` : "");
 }
 
 function formatPieceLabel(name) {
   const raw = String(name || "").trim();
   if (!raw) return "-";
-  const base = raw.replace(/\.dxf$/i, "");
+  const base = raw.replace(/\.(dxf|step|stp)$/i, "");
   const match = base.match(/\d+/);
   return match ? match[0] : base;
 }
@@ -3624,6 +3637,179 @@ function decodeDxfArrayBuffer(arrayBuffer, filename = "") {
   return String(text || "").replace(/\u0000/g, "");
 }
 
+function decodeStepArrayBuffer(arrayBuffer, filename = "") {
+  let text = "";
+  try {
+    text = new TextDecoder("utf-8").decode(arrayBuffer);
+  } catch (decodeUtf8Error) {
+    console.warn("Falha no decode utf-8 para STEP:", filename, decodeUtf8Error);
+  }
+
+  if (text.includes("\u0000")) {
+    try {
+      text = new TextDecoder("utf-16le").decode(arrayBuffer);
+    } catch (decodeUtf16Error) {
+      console.warn("Falha no decode utf-16le para STEP:", filename, decodeUtf16Error);
+    }
+  }
+
+  if (!/ISO-10303-21/i.test(String(text).slice(0, 4000))) {
+    try {
+      text = new TextDecoder("latin1").decode(arrayBuffer);
+    } catch (decodeLatin1Error) {
+      console.warn("Falha no decode latin1 para STEP:", filename, decodeLatin1Error);
+    }
+  }
+
+  return String(text || "").replace(/\u0000/g, "");
+}
+
+function base64ToArrayBuffer(base64Text) {
+  const bin = atob(String(base64Text || ""));
+  const len = bin.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i += 1) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function importStepViaPython(stepText, filename = "arquivo.step") {
+  if (typeof stepText !== "string" || !stepText.trim()) {
+    return { ok: false, error: "Conteudo STEP vazio." };
+  }
+
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  let timeoutId = 0;
+  if (controller) {
+    timeoutId = window.setTimeout(() => {
+      try { controller.abort(); } catch (_error) {}
+    }, STEP_PARSE_TIMEOUT_MS);
+  }
+
+  try {
+    const response = await fetch("/api/parse-step", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: String(filename || "arquivo.step"),
+        text: String(stepText || "")
+      }),
+      signal: controller ? controller.signal : undefined
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: `Endpoint STEP indisponivel (HTTP ${response.status}). Rode: python server.py --host 127.0.0.1 --port 5173`
+      };
+    }
+
+    const payload = await response.json().catch(() => ({}));
+    if (!payload?.ok) {
+      return {
+        ok: false,
+        error: String(payload?.error || "Falha ao processar STEP no servidor local.")
+      };
+    }
+
+    return payload;
+  } catch (error) {
+    const isAbort = String(error?.name || "") === "AbortError";
+    return {
+      ok: false,
+      error: isAbort
+        ? "Timeout ao processar STEP no servidor local."
+        : "Falha de conexao com o servidor STEP. Rode: python server.py --host 127.0.0.1 --port 5173"
+    };
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+  }
+}
+
+function buildGroupFromStepPayload(payload, filename = "arquivo.step") {
+  const mesh = payload?.mesh;
+  if (!mesh || mesh.format !== "stl_base64" || typeof mesh.data !== "string" || !mesh.data.length) {
+    return null;
+  }
+
+  const loader = new STLLoader();
+  const buffer = base64ToArrayBuffer(mesh.data);
+  const geometry = loader.parse(buffer);
+  if (!geometry || !(geometry instanceof THREE.BufferGeometry)) return null;
+
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+
+  const material = new THREE.MeshStandardMaterial({
+    color: new THREE.Color().setHSL(Math.random(), 0.6, 0.55),
+    metalness: 0.05,
+    roughness: 0.85
+  });
+
+  const meshObj = new THREE.Mesh(geometry, material);
+  const group = new THREE.Group();
+  group.name = String(filename || "arquivo.step");
+  group.add(meshObj);
+  return group;
+}
+
+async function importSingleStepFilePythonPipeline(
+  file,
+  autoCenter = true,
+  onIssue = null,
+  onCacheEvent = null
+) {
+  let fileBuffer = null;
+  let stepHash = "";
+  let meshCacheKey = "";
+
+  try {
+    fileBuffer = await file.arrayBuffer();
+  } catch (readError) {
+    console.error("Falha ao ler arquivo STEP:", file?.name, readError);
+    reportImportIssue(onIssue, `Falha ao ler ${file?.name || "arquivo STEP"}.`);
+    return false;
+  }
+
+  try {
+    stepHash = await computeArrayBufferHashHex(fileBuffer);
+    meshCacheKey = buildStepMeshCacheKeyFromHash(stepHash);
+  } catch (_hashError) {
+    meshCacheKey = "";
+  }
+
+  if (meshCacheKey) {
+    const cachedGroup = await getMeshGroupFromPersistentCache(meshCacheKey, file?.name || "");
+    if (cachedGroup) {
+      if (typeof onCacheEvent === "function") onCacheEvent({ type: "step-mesh-hit", fileName: file?.name || "" });
+      return finalizeImportedGroup(cachedGroup, autoCenter);
+    }
+    if (typeof onCacheEvent === "function") onCacheEvent({ type: "step-mesh-miss", fileName: file?.name || "" });
+  }
+
+  const stepText = decodeStepArrayBuffer(fileBuffer, file?.name || "");
+  const parsedPayload = await importStepViaPython(stepText, file?.name || "arquivo.step");
+  if (!parsedPayload?.ok) {
+    reportImportIssue(onIssue, String(parsedPayload?.error || `Falha ao importar ${file?.name || "arquivo STEP"}.`));
+    return false;
+  }
+
+  const localGroup = buildGroupFromStepPayload(parsedPayload, file?.name || "arquivo.step");
+  if (!localGroup) {
+    reportImportIssue(onIssue, `Falha ao montar malha 3D para ${file?.name || "arquivo STEP"}.`);
+    return false;
+  }
+
+  if (meshCacheKey) {
+    const persistedMesh = await putMeshGroupInPersistentCache(meshCacheKey, localGroup, file, 0);
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: persistedMesh ? "step-mesh-save" : "step-mesh-save-failed", fileName: file?.name || "" });
+    }
+  }
+
+  return finalizeImportedGroup(localGroup, autoCenter);
+}
+
 fileInput.addEventListener("change", async (ev) => {
   const files = [...(ev.target.files || [])];
   if (files.length === 0) return;
@@ -3639,6 +3825,9 @@ fileInput.addEventListener("change", async (ev) => {
     parseHits: 0,
     parseMisses: 0,
     parseSaves: 0,
+    stepMeshHits: 0,
+    stepMeshMisses: 0,
+    stepMeshSaves: 0,
     errors: 0
   };
   let importedCount = 0;
@@ -3699,6 +3888,80 @@ fileInput.addEventListener("change", async (ev) => {
   fitToScene();
   fileInput.value = "";
 });
+
+if (stepInput) {
+  stepInput.addEventListener("change", async (ev) => {
+    const files = [...(ev.target.files || [])].filter((f) => /\.(step|stp)$/i.test(String(f?.name || "")));
+    if (files.length === 0) return;
+
+    const importStart = performance.now();
+    const autoCenter = !!autoCenterEl.checked;
+    const importIssues = [];
+    const cacheStats = {
+      meshHits: 0,
+      meshMisses: 0,
+      meshSaves: 0,
+      parseHits: 0,
+      parseMisses: 0,
+      parseSaves: 0,
+      stepMeshHits: 0,
+      stepMeshMisses: 0,
+      stepMeshSaves: 0,
+      errors: 0
+    };
+    let importedCount = 0;
+    updateCacheStatsBadge(cacheStats);
+
+    await Promise.all(files.map(async (f) => {
+      try {
+        const ok = await importSingleStepFilePythonPipeline(
+          f,
+          autoCenter,
+          (msg) => importIssues.push(msg),
+          (event) => {
+            const type = String(event?.type || "");
+            if (type === "step-mesh-hit") cacheStats.stepMeshHits += 1;
+            else if (type === "step-mesh-miss") cacheStats.stepMeshMisses += 1;
+            else if (type === "step-mesh-save") cacheStats.stepMeshSaves += 1;
+            else if (type.endsWith("-failed")) cacheStats.errors += 1;
+            updateCacheStatsBadge(cacheStats);
+          }
+        );
+        if (ok) importedCount += 1;
+      } catch (error) {
+        console.error("Falha inesperada no modo STEP:", f?.name, error);
+        importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo STEP"}. Veja o console (F12).`);
+      } finally {
+        updateBatchTimeBadge(performance.now() - importStart);
+      }
+    }));
+
+    const importDurationMs = performance.now() - importStart;
+    updateBatchTimeBadge(importDurationMs);
+
+    if (importIssues.length > 0) {
+      const uniqueIssues = [...new Set(importIssues)];
+      for (const msg of uniqueIssues) console.warn("[Import warning]", msg);
+
+      if (importedCount === 0) {
+        const shownIssues = uniqueIssues.slice(0, 8);
+        const moreCount = uniqueIssues.length - shownIssues.length;
+        const body = shownIssues.map((msg, idx) => `${idx + 1}. ${msg}`).join("\n");
+        const suffix = moreCount > 0 ? `\n... e mais ${moreCount} aviso(s).` : "";
+        alert(`Nenhuma peca STEP valida foi importada.\n\n${body}${suffix}`);
+      } else if (console && typeof console.info === "function") {
+        console.info(
+          `Importacao STEP concluida com aviso(s): ${importedCount}/${files.length} arquivo(s) importado(s), ` +
+          `${uniqueIssues.length} aviso(s).`
+        );
+      }
+    }
+
+    fitToScene();
+    stepInput.value = "";
+  });
+}
+
 fitBtn.addEventListener("click", () => {
   updateGlobalBounds();
   fitToScene();

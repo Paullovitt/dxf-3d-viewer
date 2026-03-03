@@ -1,10 +1,10 @@
 # DXF 3D Viewer
 
-Visualizador/importador de pecas DXF em 3D (Three.js), focado em arquivos CNC com geometria mista (`LWPOLYLINE`, `POLYLINE`, `LINE`, `ARC`, `CIRCLE`, `SPLINE`) e correcoes para DXF imperfeito.
+Visualizador/importador de pecas DXF e STEP em 3D (Three.js), focado em arquivos CNC com geometria mista (`LWPOLYLINE`, `POLYLINE`, `LINE`, `ARC`, `CIRCLE`, `SPLINE`) e correcoes para DXF imperfeito.
 
 ## 1. Objetivo
 
-Este projeto importa DXFs 2D, reconstrui contornos validos (borda + furos) e gera malhas 3D extrudadas.
+Este projeto importa DXFs 2D (reconstrucao de contorno + extrusao) e tambem arquivos STEP/STP para visualizacao 3D real (via API local Python).
 
 Prioridades do projeto:
 - fidelidade de contorno (evitar preencher furo por erro de loop)
@@ -15,13 +15,18 @@ Prioridades do projeto:
 
 - Navegador moderno com suporte a ES Modules e Web Workers.
 - Servidor HTTP local (nao abrir `index.html` via `file://`).
+- Para importar STEP/STP: executar `server.py` (API local com `cadquery/OCP`).
 
 ## 3. Bibliotecas e APIs usadas
 
 Bibliotecas externas:
 - `three@0.160.0` via importmap (`index.html`)
 - `OrbitControls` e `TransformControls` (addons do Three)
+- `STLLoader` (addon do Three) para montar malha 3D retornada pela API STEP
 - `dxf-parser@1.1.2` via `esm.sh` (fallback de parse)
+
+Backend opcional para STEP:
+- `cadquery`/`OCP` no `server.py` para converter STEP -> STL binario (base64)
 
 APIs nativas do browser:
 - `Web Worker` para parse em paralelo (`dxf-worker.js`)
@@ -30,7 +35,7 @@ APIs nativas do browser:
 
 ## 4. Como executar
 
-### 4.1 Modo atual (somente frontend / estatico)
+### 4.1 Modo estatico (DXF no navegador)
 
 Na pasta do projeto:
 
@@ -43,6 +48,43 @@ Abrir:
 `http://127.0.0.1:5173`
 
 Observacao: apos atualizar `app.js`, use `Ctrl + F5` para evitar cache antigo.
+
+### 4.2 Modo completo (DXF + STEP com API local)
+
+Na pasta do projeto:
+
+```bash
+python server.py --host 127.0.0.1 --port 5173 --dir .
+```
+
+Abrir:
+
+`http://127.0.0.1:5173`
+
+Neste modo, o botão `Importar STEP(s)` fica funcional (endpoint `POST /api/parse-step`).
+
+### 4.3 Capturar layout em screenshot (headless)
+
+Para gerar uma imagem do layout automaticamente (sem abrir navegador manual):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\capture-layout.ps1
+```
+
+Isso salva um PNG em `.\screenshots\layout-YYYYMMDD-HHMMSS.png`.
+
+Parametros uteis:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\capture-layout.ps1 `
+  -Url "http://127.0.0.1:5173" `
+  -OutFile ".\screenshots\meu-layout.png" `
+  -Width 1920 -Height 1080 -WaitMs 7000
+```
+
+Requisitos:
+- servidor local ativo em `http://127.0.0.1:5173`
+- Chrome ou Edge instalado (o script detecta automaticamente)
 
 ## 5. Fluxo de execucao (alto nivel)
 
