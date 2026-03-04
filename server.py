@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import math
 import os
 import struct
 import tempfile
+import threading
+import time
+from collections import OrderedDict
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -20,8 +24,84 @@ try:
 except Exception:
     cq = None
 
+
+def _configure_cuda_env() -> str:
+    candidates: list[Path] = []
+
+    env_cuda = str(os.environ.get("CUDA_PATH", "")).strip()
+    if env_cuda:
+        candidates.append(Path(env_cuda))
+
+    base = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA")
+    if base.exists():
+        try:
+            versions = sorted(
+                [p for p in base.iterdir() if p.is_dir() and p.name.lower().startswith("v")],
+                key=lambda p: p.name.lower(),
+                reverse=True,
+            )
+            candidates.extend(versions)
+        except Exception:
+            pass
+
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for c in candidates:
+        key = str(c).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(c)
+
+    current_path = os.environ.get("PATH", "")
+    path_parts = [p for p in current_path.split(os.pathsep) if p]
+
+    for root in ordered:
+        bin_dir = root / "bin"
+        libnvvp_dir = root / "libnvvp"
+        if not bin_dir.exists():
+            continue
+
+        root_s = str(root)
+        bin_s = str(bin_dir)
+        lib_s = str(libnvvp_dir)
+
+        new_path_parts: list[str] = []
+        if bin_s not in path_parts:
+            new_path_parts.append(bin_s)
+        if libnvvp_dir.exists() and lib_s not in path_parts:
+            new_path_parts.append(lib_s)
+        new_path_parts.extend(path_parts)
+        os.environ["PATH"] = os.pathsep.join(new_path_parts)
+
+        if not env_cuda:
+            os.environ["CUDA_PATH"] = root_s
+        return root_s
+
+    return ""
+
+
+CUDA_PATH_DETECTED = _configure_cuda_env()
+
+try:
+    import cupy as cp  # type: ignore
+
+    _cuda_ok = False
+    try:
+        _cuda_ok = cp.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        _cuda_ok = False
+    CUDA_AVAILABLE = bool(_cuda_ok)
+except Exception:
+    cp = None
+    CUDA_AVAILABLE = False
+
 EPS = 1e-6
 CHORD_TOL = 0.8
+
+PARSED_CACHE_MAX_ENTRIES = 64
+PARSED_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+PARSED_CACHE_LOCK = threading.Lock()
 
 
 def dist(a: list[float], b: list[float]) -> float:
@@ -36,13 +116,43 @@ def parse_num(value: Any, fallback: float = 0.0) -> float:
         return fallback
 
 
-def arc_points(center: list[float], radius: float, start_deg: float, end_deg: float, chord_tol: float = CHORD_TOL) -> list[list[float]]:
+def normalize_compute_mode(raw_mode: Any) -> str:
+    mode = str(raw_mode or "cpu").strip().lower()
+    if mode not in {"cpu", "cuda"}:
+        mode = "cpu"
+    if mode == "cuda" and not CUDA_AVAILABLE:
+        return "cpu"
+    return mode
+
+
+def arc_points(
+    center: list[float],
+    radius: float,
+    start_deg: float,
+    end_deg: float,
+    chord_tol: float = CHORD_TOL,
+    compute_mode: str = "cpu",
+) -> list[list[float]]:
     if radius <= 0:
         return []
     sweep = end_deg - start_deg
     while sweep <= 0:
         sweep += 360.0
     steps = max(8, math.ceil((math.pi * sweep / 180.0 * radius) / max(chord_tol, 0.05)))
+    mode = normalize_compute_mode(compute_mode)
+
+    if mode == "cuda" and cp is not None and CUDA_AVAILABLE:
+        angles = cp.linspace(
+            math.radians(start_deg),
+            math.radians(start_deg + sweep),
+            steps + 1,
+            dtype=cp.float64,
+        )
+        xs = center[0] + radius * cp.cos(angles)
+        ys = center[1] + radius * cp.sin(angles)
+        arr = cp.stack((xs, ys), axis=1).get()
+        return [[float(v[0]), float(v[1])] for v in arr]
+
     points: list[list[float]] = []
     for i in range(steps + 1):
         angle = (start_deg + sweep * (i / steps)) * math.pi / 180.0
@@ -321,8 +431,30 @@ def normalize_contours(contours: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {"contours": shifted, "width": max_x - min_x, "height": max_y - min_y}
 
 
-def parse_dxf_text(text: str) -> dict[str, Any]:
-    doc = ezdxf.read(io.StringIO(text))
+def _parsed_cache_get(key: str) -> dict[str, Any] | None:
+    with PARSED_CACHE_LOCK:
+        value = PARSED_CACHE.get(key)
+        if value is None:
+            return None
+        PARSED_CACHE.move_to_end(key)
+        return value
+
+
+def _parsed_cache_put(key: str, parsed: dict[str, Any]) -> None:
+    with PARSED_CACHE_LOCK:
+        old = PARSED_CACHE.pop(key, None)
+        if old is not None:
+            pass
+        PARSED_CACHE[key] = parsed
+        PARSED_CACHE.move_to_end(key)
+        while len(PARSED_CACHE) > PARSED_CACHE_MAX_ENTRIES:
+            PARSED_CACHE.popitem(last=False)
+
+
+def parse_dxf_text(text: str, compute_mode: str = "cpu") -> dict[str, Any]:
+    mode = normalize_compute_mode(compute_mode)
+    normalized_text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    doc = ezdxf.read(io.StringIO(normalized_text))
     contours: list[dict[str, Any]] = []
 
     for entity in doc.modelspace():
@@ -344,6 +476,7 @@ def parse_dxf_text(text: str) -> dict[str, Any]:
                 float(entity.dxf.start_angle),
                 float(entity.dxf.end_angle),
                 CHORD_TOL,
+                compute_mode=mode,
             )
             if len(points) > 1:
                 contours.append({"points": points, "closed": False})
@@ -355,6 +488,7 @@ def parse_dxf_text(text: str) -> dict[str, Any]:
                 0.0,
                 360.0,
                 CHORD_TOL,
+                compute_mode=mode,
             )
             if points and dist(points[0], points[-1]) < 1e-6:
                 points.pop()
@@ -404,6 +538,18 @@ def parse_dxf_text(text: str) -> dict[str, Any]:
     if not parsed:
         raise ValueError("Nenhum contorno valido encontrado no DXF.")
     return parsed
+
+
+def parse_dxf_text_cached(text: str, compute_mode: str = "cpu") -> tuple[dict[str, Any], bool, str]:
+    mode = normalize_compute_mode(compute_mode)
+    cache_key = hashlib.sha1((mode + "\n" + text).encode("utf-8", "ignore")).hexdigest()
+    cached = _parsed_cache_get(cache_key)
+    if cached is not None:
+        return cached, True, mode
+
+    parsed = parse_dxf_text(text, compute_mode=mode)
+    _parsed_cache_put(cache_key, parsed)
+    return parsed, False, mode
 
 
 def parse_step_text_to_stl_base64(text: str, filename: str = "arquivo.step") -> dict[str, Any]:
@@ -508,8 +654,23 @@ class ViewerHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            parsed = parse_dxf_text(text)
-            self._send_json({"ok": True, "filename": filename, "parsed": parsed})
+            requested_mode = normalize_compute_mode(payload.get("compute_mode", "cpu"))
+            parse_start = time.perf_counter()
+            parsed, from_cache, used_mode = parse_dxf_text_cached(text, requested_mode)
+            parse_ms = (time.perf_counter() - parse_start) * 1000.0
+            self._send_json(
+                {
+                    "ok": True,
+                    "filename": filename,
+                    "parsed": parsed,
+                    "requestedMode": requested_mode,
+                    "usedMode": used_mode,
+                    "fromCache": bool(from_cache),
+                    "cudaAvailable": CUDA_AVAILABLE,
+                    "cudaPath": CUDA_PATH_DETECTED,
+                    "parseMs": round(parse_ms, 2),
+                }
+            )
         except Exception as exc:
             self._send_json({"ok": False, "filename": filename, "error": str(exc)})
 
@@ -535,6 +696,10 @@ def main() -> None:
 
     print(f"Servidor ativo em http://{args.host}:{args.port}")
     print("API DXF Python: POST /api/parse-dxf")
+    if CUDA_AVAILABLE:
+        print(f"DXF CUDA: disponivel ({CUDA_PATH_DETECTED or 'CUDA_PATH'})")
+    else:
+        print("DXF CUDA: indisponivel (fallback CPU automatico)")
     if cq is None:
         print("API STEP Python: indisponivel (cadquery nao instalado)")
     else:

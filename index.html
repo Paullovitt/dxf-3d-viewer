@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>DXF 3D Viewer</title>
+  <title>DXFs 3D</title>
   <link rel="stylesheet" href="./styles.css" />
 
   <script type="importmap">
@@ -39,7 +39,16 @@
       <label class="row">
         Modo importacao
         <select id="importMode">
+          <option value="backend" selected>Backend Python (DXF)</option>
           <option value="browser">Atual (Browser DXF)</option>
+        </select>
+      </label>
+
+      <label class="row">
+        Processamento DXF
+        <select id="computeMode">
+          <option value="cuda" selected>CUDA (GPU)</option>
+          <option value="cpu">CPU</option>
         </select>
       </label>
 
@@ -61,6 +70,6 @@
     Mouse: <b>Esq</b> orbitar | <b>Meio</b> zoom | <b>Dir</b> pan
   </div>
 
-  <script type="module" src="./app.js?v=legacyfix32"></script>
+  <script type="module" src="./app.js?v=legacyfix33"></script>
 </body>
 </html>

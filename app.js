@@ -1,4 +1,4 @@
-import * as THREE from "three";
+﻿import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
@@ -77,6 +77,8 @@ const LAYOUT_PUSH_STEP = 18;
 const EPS = 1e-6;
 const CPU_CORES = Math.max(1, Number(navigator.hardwareConcurrency || 1));
 const DXF_PARSE_WORKERS = Math.max(1, CPU_CORES);
+const BACKEND_IMPORT_CONCURRENCY = Math.max(1, CPU_CORES);
+const DEFAULT_COMPUTE_MODE = "cuda";
 const DXF_CACHE_DB_NAME = "dxf-3d-viewer-cache";
 const DXF_PARSE_CACHE_STORE_NAME = "parsed-contours";
 const DXF_MESH_CACHE_STORE_NAME = "mesh-groups";
@@ -88,6 +90,7 @@ const DXF_PARSE_CACHE_MAX_BYTES = 80 * 1024 * 1024;
 const DXF_MESH_CACHE_MAX_ENTRIES = 32;
 const DXF_MESH_CACHE_MAX_BYTES = 280 * 1024 * 1024;
 const STEP_MESH_CACHE_PIPELINE_VERSION = "step-mesh-v1";
+const DXF_PARSE_TIMEOUT_MS = 90000;
 const STEP_PARSE_TIMEOUT_MS = 60000;
 const DXF_CACHE_STORE_NAME = DXF_PARSE_CACHE_STORE_NAME;
 const DXF_CACHE_PIPELINE_VERSION = DXF_PARSE_CACHE_PIPELINE_VERSION;
@@ -3509,6 +3512,144 @@ async function importSingleFileBrowserPipeline(
   }
 }
 
+async function importSingleFileBackendPipeline(
+  file,
+  thickness,
+  computeMode = DEFAULT_COMPUTE_MODE,
+  autoCenter = true,
+  onIssue = null,
+  onCacheEvent = null
+) {
+  let fileBuffer = null;
+  let dxfHash = "";
+  let meshCacheKey = "";
+  let text = "";
+
+  try {
+    fileBuffer = await file.arrayBuffer();
+  } catch (readError) {
+    console.error("Falha ao ler arquivo DXF:", file?.name, readError);
+    reportImportIssue(onIssue, `Falha ao ler ${file?.name || "arquivo DXF"}.`);
+    return false;
+  }
+
+  try {
+    dxfHash = await computeArrayBufferHashHex(fileBuffer);
+    meshCacheKey = buildMeshCacheKeyFromHash(dxfHash, thickness);
+  } catch (_hashError) {
+    meshCacheKey = "";
+  }
+
+  if (meshCacheKey) {
+    const cachedGroup = await getMeshGroupFromPersistentCache(meshCacheKey, file?.name || "");
+    if (cachedGroup) {
+      if (typeof onCacheEvent === "function") {
+        onCacheEvent({ type: "mesh-hit", fileName: file?.name || "" });
+      }
+      return finalizeImportedGroup(cachedGroup, autoCenter);
+    }
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: "mesh-miss", fileName: file?.name || "" });
+    }
+  }
+
+  try {
+    text = decodeDxfArrayBuffer(fileBuffer, file?.name || "");
+  } catch (decodeError) {
+    console.error("Falha no decode DXF:", file?.name, decodeError);
+    reportImportIssue(onIssue, `Falha ao decodificar ${file?.name || "arquivo DXF"}.`);
+    return false;
+  }
+
+  const requestedMode = String(computeMode || DEFAULT_COMPUTE_MODE).toLowerCase() === "cuda" ? "cuda" : "cpu";
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  let timeoutId = 0;
+  if (controller) {
+    timeoutId = window.setTimeout(() => {
+      try { controller.abort(); } catch (_error) {}
+    }, DXF_PARSE_TIMEOUT_MS);
+  }
+
+  let payload = null;
+  try {
+    const response = await fetch("/api/parse-dxf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: String(file?.name || "arquivo.dxf"),
+        text: String(text || ""),
+        compute_mode: requestedMode
+      }),
+      signal: controller ? controller.signal : undefined
+    });
+
+    payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload?.ok) {
+      const detail = String(payload?.detail || payload?.error || `HTTP ${response.status}`);
+      throw new Error(detail);
+    }
+  } catch (error) {
+    const isAbort = String(error?.name || "") === "AbortError";
+    console.error("Falha no backend de parse DXF:", file?.name, error);
+    reportImportIssue(
+      onIssue,
+      isAbort
+        ? `Timeout no backend ao importar ${file?.name || "arquivo DXF"}.`
+        : `Falha no backend ao importar ${file?.name || "arquivo DXF"}.`
+    );
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: "parse-error", fileName: file?.name || "" });
+    }
+    return false;
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+  }
+
+  const parsed = payload?.parsed;
+  if (!parsed || !Array.isArray(parsed.contours) || parsed.contours.length < 1) {
+    reportImportIssue(onIssue, `Backend retornou parse vazio para ${file?.name || "arquivo DXF"}.`);
+    if (typeof onCacheEvent === "function") {
+      onCacheEvent({ type: "parse-error", fileName: file?.name || "" });
+    }
+    return false;
+  }
+
+  if (typeof onCacheEvent === "function") {
+    onCacheEvent({
+      type: payload?.fromCache ? "parse-hit" : "parse-miss",
+      fileName: file?.name || "",
+      usedMode: String(payload?.usedMode || "cpu")
+    });
+  }
+
+  let builtGroupForCache = null;
+  try {
+    const imported = addDxfToScene(
+      text,
+      file?.name || "arquivo.dxf",
+      thickness,
+      autoCenter,
+      onIssue,
+      parsed,
+      (localGroup) => {
+        builtGroupForCache = localGroup;
+      }
+    );
+
+    if (imported && builtGroupForCache && meshCacheKey) {
+      const persistedMesh = await putMeshGroupInPersistentCache(meshCacheKey, builtGroupForCache, file, thickness);
+      if (typeof onCacheEvent === "function") {
+        onCacheEvent({ type: persistedMesh ? "mesh-save" : "mesh-save-failed", fileName: file?.name || "" });
+      }
+    }
+    return imported;
+  } catch (error) {
+    console.error("Falha ao montar malha com parse backend:", file?.name, error);
+    reportImportIssue(onIssue, `Falha ao montar malha de ${file?.name || "arquivo DXF"}.`);
+    return false;
+  }
+}
+
 function updateGlobalBounds() {
   bboxAll.makeEmpty();
   for (const child of partsGroup.children) {
@@ -3543,6 +3684,7 @@ function fitToScene(padding = 1.25) {
 const fileInput = document.getElementById("fileInput");
 const stepInput = document.getElementById("stepInput");
 const importModeEl = document.getElementById("importMode");
+const computeModeEl = document.getElementById("computeMode");
 const thicknessEl = document.getElementById("thickness");
 const autoCenterEl = document.getElementById("autoCenter");
 const fitBtn = document.getElementById("fitBtn");
@@ -3551,11 +3693,33 @@ const pieceCountEl = document.getElementById("pieceCount");
 const batchTimeEl = document.getElementById("batchTime");
 const cacheStatsEl = document.getElementById("cacheStats");
 const selectedPieceEl = document.getElementById("selectedPiece");
+const IMPORT_MODE_BACKEND = "backend";
 const IMPORT_MODE_BROWSER = "browser";
 
 if (importModeEl) {
-  importModeEl.value = IMPORT_MODE_BROWSER;
+  const hasBackendOption = Array.from(importModeEl.options || []).some(
+    (opt) => String(opt?.value || "").toLowerCase() === IMPORT_MODE_BACKEND
+  );
+  importModeEl.value = hasBackendOption ? IMPORT_MODE_BACKEND : IMPORT_MODE_BROWSER;
 }
+
+if (computeModeEl) {
+  const hasCudaOption = Array.from(computeModeEl.options || []).some(
+    (opt) => String(opt?.value || "").toLowerCase() === DEFAULT_COMPUTE_MODE
+  );
+  computeModeEl.value = hasCudaOption ? DEFAULT_COMPUTE_MODE : "cpu";
+}
+
+function syncComputeModeUi() {
+  if (!computeModeEl) return;
+  const mode = String(importModeEl?.value || IMPORT_MODE_BACKEND).toLowerCase();
+  computeModeEl.disabled = mode !== IMPORT_MODE_BACKEND;
+}
+
+if (importModeEl) {
+  importModeEl.addEventListener("change", syncComputeModeUi);
+}
+syncComputeModeUi();
 
 function updatePieceCountBadge() {
   if (!pieceCountEl) return;
@@ -3585,10 +3749,12 @@ function updateCacheStatsBadge(stats = null) {
   const stepMeshMisses = Number(stats.stepMeshMisses || 0);
   const stepMeshSaves = Number(stats.stepMeshSaves || 0);
   const errors = Number(stats.errors || 0);
+  const mode = String(stats.mode || "").trim();
 
   cacheStatsEl.textContent =
     `Cache DXF M:${meshHits}/${meshMisses}/${meshSaves} P:${parseHits}/${parseMisses}/${parseSaves}` +
     ` | STEP M:${stepMeshHits}/${stepMeshMisses}/${stepMeshSaves}` +
+    (mode ? ` | Modo:${mode.toUpperCase()}` : "") +
     (errors > 0 ? ` ERR:${errors}` : "");
 }
 
@@ -3664,6 +3830,27 @@ function decodeStepArrayBuffer(arrayBuffer, filename = "") {
   return String(text || "").replace(/\u0000/g, "");
 }
 
+async function runWithConcurrency(items, limit, task) {
+  const list = Array.isArray(items) ? items : Array.from(items || []);
+  if (list.length === 0) return;
+
+  const maxWorkers = Math.max(1, Math.min(Number(limit || 1), list.length));
+  let nextIndex = 0;
+
+  async function workerLoop() {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= list.length) return;
+      await task(list[current], current);
+    }
+  }
+
+  const running = [];
+  for (let i = 0; i < maxWorkers; i += 1) running.push(workerLoop());
+  await Promise.all(running);
+}
+
 function base64ToArrayBuffer(base64Text) {
   const bin = atob(String(base64Text || ""));
   const len = bin.length;
@@ -3699,7 +3886,7 @@ async function importStepViaPython(stepText, filename = "arquivo.step") {
     if (!response.ok) {
       return {
         ok: false,
-        error: `Endpoint STEP indisponivel (HTTP ${response.status}). Rode: python server.py --host 127.0.0.1 --port 5173`
+        error: `Endpoint STEP indisponivel (HTTP ${response.status}). Rode: py -3.9 run_server.py`
       };
     }
 
@@ -3718,7 +3905,7 @@ async function importStepViaPython(stepText, filename = "arquivo.step") {
       ok: false,
       error: isAbort
         ? "Timeout ao processar STEP no servidor local."
-        : "Falha de conexao com o servidor STEP. Rode: python server.py --host 127.0.0.1 --port 5173"
+        : "Falha de conexao com o servidor STEP. Rode: py -3.9 run_server.py"
     };
   } finally {
     if (timeoutId) window.clearTimeout(timeoutId);
@@ -3816,6 +4003,8 @@ fileInput.addEventListener("change", async (ev) => {
 
   const importStart = performance.now();
   const thickness = Number(thicknessEl.value || 5);
+  const importMode = String(importModeEl?.value || IMPORT_MODE_BACKEND).toLowerCase();
+  const computeMode = String(computeModeEl?.value || DEFAULT_COMPUTE_MODE).toLowerCase();
   const autoCenter = !!autoCenterEl.checked;
   const importIssues = [];
   const cacheStats = {
@@ -3828,41 +4017,58 @@ fileInput.addEventListener("change", async (ev) => {
     stepMeshHits: 0,
     stepMeshMisses: 0,
     stepMeshSaves: 0,
-    errors: 0
+    errors: 0,
+    mode: importMode === IMPORT_MODE_BACKEND ? computeMode : "browser"
   };
   let importedCount = 0;
-  const workerPool = getDxfWorkerPool();
+  const workerPool = importMode === IMPORT_MODE_BROWSER ? getDxfWorkerPool() : null;
   updateCacheStatsBadge(cacheStats);
 
-  await Promise.all(files.map(async (f) => {
+  const handleCacheEvent = (event) => {
+    const type = String(event?.type || "");
+    if (type === "mesh-hit") cacheStats.meshHits += 1;
+    else if (type === "mesh-miss") cacheStats.meshMisses += 1;
+    else if (type === "mesh-save") cacheStats.meshSaves += 1;
+    else if (type === "parse-hit") cacheStats.parseHits += 1;
+    else if (type === "parse-miss") cacheStats.parseMisses += 1;
+    else if (type === "parse-save") cacheStats.parseSaves += 1;
+    else if (type === "parse-error") cacheStats.errors += 1;
+    else if (type.endsWith("-failed")) cacheStats.errors += 1;
+    if (event?.usedMode) cacheStats.mode = String(event.usedMode).toLowerCase();
+    updateCacheStatsBadge(cacheStats);
+  };
+
+  await runWithConcurrency(files, BACKEND_IMPORT_CONCURRENCY, async (f) => {
     try {
-      const ok = await importSingleFileBrowserPipeline(
-        f,
-        thickness,
-        autoCenter,
-        (msg) => importIssues.push(msg),
-        workerPool,
-        (event) => {
-          const type = String(event?.type || "");
-          if (type === "mesh-hit") cacheStats.meshHits += 1;
-          else if (type === "mesh-miss") cacheStats.meshMisses += 1;
-          else if (type === "mesh-save") cacheStats.meshSaves += 1;
-          else if (type === "parse-hit") cacheStats.parseHits += 1;
-          else if (type === "parse-miss") cacheStats.parseMisses += 1;
-          else if (type === "parse-save") cacheStats.parseSaves += 1;
-          else if (type.endsWith("-failed")) cacheStats.errors += 1;
-          updateCacheStatsBadge(cacheStats);
-        }
-      );
+      let ok = false;
+      if (importMode === IMPORT_MODE_BACKEND) {
+        ok = await importSingleFileBackendPipeline(
+          f,
+          thickness,
+          computeMode,
+          autoCenter,
+          (msg) => importIssues.push(msg),
+          handleCacheEvent
+        );
+      } else {
+        ok = await importSingleFileBrowserPipeline(
+          f,
+          thickness,
+          autoCenter,
+          (msg) => importIssues.push(msg),
+          workerPool,
+          handleCacheEvent
+        );
+      }
       if (ok) importedCount += 1;
     } catch (error) {
-      console.error("Falha inesperada no modo browser DXF:", f?.name, error);
+      const modeLabel = importMode === IMPORT_MODE_BACKEND ? "backend DXF" : "browser DXF";
+      console.error(`Falha inesperada no modo ${modeLabel}:`, f?.name, error);
       importIssues.push(`Falha inesperada ao importar ${f?.name || "arquivo"}. Veja o console (F12).`);
     } finally {
-      // Atualiza o tempo enquanto o lote ainda esta processando.
       updateBatchTimeBadge(performance.now() - importStart);
     }
-  }));
+  });
 
   const importDurationMs = performance.now() - importStart;
   updateBatchTimeBadge(importDurationMs);
@@ -3993,3 +4199,4 @@ function animate() {
   renderer.render(scene, camera);
 }
 animate();
+

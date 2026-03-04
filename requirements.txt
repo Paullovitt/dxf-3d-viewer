@@ -1,0 +1,5 @@
+ezdxf==1.4.2
+# Optional for STEP/STP import:
+# cadquery
+# Optional for DXF CUDA parse:
+# cupy-cuda12x
